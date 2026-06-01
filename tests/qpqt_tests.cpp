@@ -1,6 +1,6 @@
 /**
  * qpqt_tests.cpp
- * Combined test harness — all 36 test cases.
+ * Combined test harness — 39 test cases.
  *
  * Compile:
  *   g++ -O2 -std=c++17 -fopenmp \
@@ -448,6 +448,130 @@ void test_edge_cases() {
 }
 
 // ─────────────────────────────────────────────────────────
+// Key file helpers (mirrors CLI implementation)
+// ─────────────────────────────────────────────────────────
+
+static void write_key_file(const std::string& path,
+                           const uint8_t* data, size_t len) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("Cannot write key file: " + path);
+    f.write(reinterpret_cast<const char*>(data), len);
+}
+
+static std::vector<uint8_t> read_key_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("Cannot read key file: " + path);
+    size_t size = f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> data(size);
+    f.read(reinterpret_cast<char*>(data.data()), size);
+    return data;
+}
+
+// ─────────────────────────────────────────────────────────
+// TC-KEYS: Key persistence — simulates real usage where
+// write and read are separate processes with keys on disk
+// ─────────────────────────────────────────────────────────
+
+void test_key_persistence() {
+    current_group = "Key Persistence";
+
+    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN];
+    kem_keygen(pk, sk);
+
+    // TC-KEYS-01: Keys survive disk roundtrip
+    {
+        write_key_file("/tmp/test_pub.bin", pk, ML_KEM_768_PK_LEN);
+        write_key_file("/tmp/test_sec.bin", sk, ML_KEM_768_SK_LEN);
+
+        auto pk2 = read_key_file("/tmp/test_pub.bin");
+        auto sk2 = read_key_file("/tmp/test_sec.bin");
+
+        ASSERT(pk2.size() == ML_KEM_768_PK_LEN,
+               "TC-KEYS-01: Public key file correct size");
+        ASSERT(sk2.size() == ML_KEM_768_SK_LEN,
+               "TC-KEYS-01: Secret key file correct size");
+        ASSERT(memcmp(pk, pk2.data(), ML_KEM_768_PK_LEN) == 0,
+               "TC-KEYS-01: Public key bytes survive disk roundtrip");
+        ASSERT(memcmp(sk, sk2.data(), ML_KEM_768_SK_LEN) == 0,
+               "TC-KEYS-01: Secret key bytes survive disk roundtrip");
+    }
+
+    // TC-KEYS-02: Encrypt with key loaded from disk,
+    //             decrypt with key loaded from disk
+    //             (separate load calls — simulates separate processes)
+    {
+        auto schema = make_schema();
+        uint8_t key_id[16] = {0xAA,0xBB,0xCC,0xDD,
+                              0xEE,0xFF,0x11,0x22,
+                              0x33,0x44,0x55,0x66,
+                              0x77,0x88,0x99,0x00};
+
+        // WRITE PROCESS: load public key from disk, encrypt
+        {
+            auto pk_from_disk = read_key_file("/tmp/test_pub.bin");
+            QpqtWriter w("/tmp/tc_keys.qpqt", schema,
+                         key_id, pk_from_disk.data());
+            w.write_row_group(3,
+                {pack_int32_column({10, 20, 30})},
+                {{"SSN-KEY-A", "SSN-KEY-B", "SSN-KEY-C"}}
+            );
+            w.finalize();
+        }
+
+        // READ PROCESS: load secret key from disk, decrypt
+        {
+            auto sk_from_disk = read_key_file("/tmp/test_sec.bin");
+            QpqtReader r("/tmp/tc_keys.qpqt");
+            r.set_secret_key(sk_from_disk.data());
+
+            auto row0 = r.read_row(0);
+            auto row1 = r.read_row(1);
+            auto row2 = r.read_row(2);
+
+            ASSERT(row0.int32_values[0] == 10,
+                   "TC-KEYS-02: Row 0 structural correct");
+            ASSERT(row0.pqc_values[0] == "SSN-KEY-A",
+                   "TC-KEYS-02: Row 0 PII decrypts with disk-loaded key");
+            ASSERT(row1.pqc_values[0] == "SSN-KEY-B",
+                   "TC-KEYS-02: Row 1 PII decrypts with disk-loaded key");
+            ASSERT(row2.pqc_values[0] == "SSN-KEY-C",
+                   "TC-KEYS-02: Row 2 PII decrypts with disk-loaded key");
+        }
+    }
+
+    // TC-KEYS-03: Wrong key file → GCM rejects cleanly
+    {
+        // Generate a second keypair — wrong keys
+        uint8_t pk2[ML_KEM_768_PK_LEN], sk2[ML_KEM_768_SK_LEN];
+        kem_keygen(pk2, sk2);
+        write_key_file("/tmp/test_wrong_sec.bin", sk2, ML_KEM_768_SK_LEN);
+
+        // Try to decrypt tc_keys.qpqt (encrypted with pk) using sk2
+        auto wrong_sk = read_key_file("/tmp/test_wrong_sec.bin");
+        QpqtReader r("/tmp/tc_keys.qpqt");
+        r.set_secret_key(wrong_sk.data());
+
+        bool caught = false;
+        try {
+            auto row = r.read_row(0);
+            // If we get here without exception, check value is wrong
+            // (ML-KEM decaps always returns something, but AES-GCM tag fails)
+        } catch (std::exception& e) {
+            caught = true;
+        }
+        ASSERT(caught,
+               "TC-KEYS-03: Wrong key file → GCM auth tag throws exception");
+
+        // Cleanup
+        std::remove("/tmp/test_pub.bin");
+        std::remove("/tmp/test_sec.bin");
+        std::remove("/tmp/test_wrong_sec.bin");
+        std::remove("/tmp/tc_keys.qpqt");
+    }
+}
+
+// ─────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────
 
@@ -469,6 +593,9 @@ int main() {
 
     std::cout << "\n── Edge Case Tests ──\n";
     test_edge_cases();
+
+    std::cout << "\n── Key Persistence Tests ──\n";
+    test_key_persistence();
 
     std::cout << "\n════════════════════════════════\n";
     std::cout << "Tests passed : " << tests_passed << "\n";

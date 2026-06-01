@@ -1,0 +1,38 @@
+QPQT — Quantum-Safe Columnar Storage Format
+Copyright 2026 Rohan Prabhakar
+
+Original design, implementation, and benchmarks by Rohan Prabhakar.
+First published: June 2026.
+
+Format specification: docs/QPQT_FORMAT_SPEC_v1.md
+Repository: https://github.com/Rohan1103/qpqt
+
+---
+
+This software uses the following open source components:
+
+liboqs (Open Quantum Safe)
+  License: MIT
+  https://github.com/open-quantum-safe/liboqs
+  Used for: ML-KEM-768 (FIPS 203) key encapsulation
+
+OpenSSL
+  License: Apache 2.0
+  https://www.openssl.org
+  Used for: AES-256-GCM (FIPS 197), HKDF-SHA3-256
+
+pybind11 (Python bindings, optional)
+  License: BSD-3-Clause
+  https://github.com/pybind/pybind11
+
+Apache Arrow C++ (optional integration)
+  License: Apache 2.0
+  https://arrow.apache.org
+
+---
+
+Cryptographic standards implemented:
+  FIPS 203 — ML-KEM (Module-Lattice-Based Key-Encapsulation Mechanism)
+  FIPS 197 — AES (Advanced Encryption Standard)
+  SP 800-56C — HKDF Key Derivation
+  SP 800-38D — GCM (Galois/Counter Mode)

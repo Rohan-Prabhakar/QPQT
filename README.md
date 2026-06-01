@@ -110,8 +110,6 @@ All components are NIST-approved and quantum-safe:
 └─────────────────────────────────────────────────────┘
 ```
 
-Full binary specification: [`docs/QPQT_FORMAT_SPEC_v1.md`](docs/QPQT_FORMAT_SPEC_v1.md)
-
 ## Test Coverage
 
 36 tests across correctness, cryptography, lazy decryption, performance, and edge cases:
@@ -153,14 +151,33 @@ make -j$(nproc)
 ```bash
 ./qpqt_bench
 ```
+### Key Management
+ 
+### Generate a keypair
+ 
+```bash
+./qpqt keygen --out-pub pub.bin --out-sec sec.bin
+```
+ 
+This produces:
+- `pub.bin` — ML-KEM-768 public key (1184 bytes). Safe to share with writers.
+- `sec.bin` — ML-KEM-768 secret key (2400 bytes). **Never share. Never commit.**
+- `pub.bin.keyid` — 16-byte key ID. Pass this to `--key-id` when encrypting.
 
-## Prior Art
+### Where keys should live
+ 
+| Environment | Recommended storage |
+|---|---|
+| Local development | Outside repo, e.g. `~/.qpqt/keys/` |
+| AWS | AWS KMS + Secrets Manager |
+| Azure | Azure Key Vault |
+| GCP | Cloud KMS |
+| Databricks | `dbutils.secrets` |
+| On-premise | HashiCorp Vault or HSM |
+ 
+The public key and key_id are safe in pipeline config. The secret key must never touch disk unencrypted in production fetch it from your KMS at runtime.
 
-**What exists:**
-- Generic ML-KEM + AES-GCM file encryptors (PQSpread, various GitHub projects)
-- Parquet Modular Encryption (AES-GCM only, no PQC support)
-- PQC in TLS/SSH/IPsec (network layer, not storage layer)
-- CryptDB / Monomi (query-aware encryption, classical ciphers only)
+## Value Addition
 
 **What QPQT adds:**
 - ML-KEM integrated at the **binary columnar serialization layer**
@@ -168,21 +185,10 @@ make -j$(nproc)
 - Lazy decryption tied to predicate pushdown — execution order is the optimization
 - First published row-level PQC throughput benchmarks at columnar scale
 
-## Roadmap
-
-**v1 (current):** Single-node C++ writer/reader, full crypto stack, 36 tests passing
-
-**v2:** Apache Arrow/Parquet compatibility layer, ML-DSA-65 metadata signatures,
-AVX-512 SIMD optimization, production KMS integration
-
-**v3:** Distributed operation, Spark/Databricks connector, cloud storage
-(S3/Azure Blob) direct integration
 
 ## License
-
 MIT
 
 ## Author
 
-Rohan Prabhakar — Data Engineer
-[GitHub](https://github.com/Rohan1103)
+Rohan Prabhakar
