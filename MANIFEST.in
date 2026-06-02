@@ -1,0 +1,21 @@
+# Include the C++ sources and headers the extension needs at build time.
+# qpqt_python.cpp includes ../src/*.cpp and ../include/*.h via relative
+# paths, so these directories must ship inside the source distribution
+# or a PyPI source build will fail.
+
+recursive-include include *.h
+recursive-include src *.cpp
+recursive-include python *.cpp
+
+include README.md
+include LICENSE
+include NOTICE
+include pyproject.toml
+include setup.py
+
+# Do not ship build artifacts, keys, or data
+global-exclude *.qpqt
+global-exclude *.bin
+global-exclude *.keyid
+global-exclude *.so
+global-exclude *.o
