@@ -1,0 +1,88 @@
+name: Build wheels
+
+on:
+  push:
+    tags:
+      - 'v*'        # build wheels on version tags like v0.1.0
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Start with Linux only. macOS/Windows can be added later;
+        # liboqs builds on all three but Linux is what Databricks,
+        # Spark clusters, and most data infra actually run.
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          # Which Python versions to build for
+          CIBW_BUILD: "cp38-* cp39-* cp310-* cp311-* cp312-*"
+          # Only build manylinux x86_64 (the Databricks/Spark target)
+          CIBW_ARCHS_LINUX: "x86_64"
+          CIBW_SKIP: "*-musllinux*"
+
+          # Before building the wheel in each manylinux container,
+          # build and install liboqs from source into /usr/local.
+          # auditwheel will then bundle the resulting .so into the wheel.
+          CIBW_BEFORE_ALL_LINUX: >
+            yum install -y openssl-devel cmake3 ninja-build git &&
+            git clone --depth 1 https://github.com/open-quantum-safe/liboqs /tmp/liboqs &&
+            cmake3 -GNinja -S /tmp/liboqs -B /tmp/liboqs/build
+              -DOQS_DIST_BUILD=ON
+              -DCMAKE_INSTALL_PREFIX=/usr/local
+              -DCMAKE_BUILD_TYPE=Release
+              -DBUILD_SHARED_LIBS=ON &&
+            cmake3 --build /tmp/liboqs/build --target install
+
+          # Tell auditwheel where the bundled libs live
+          CIBW_ENVIRONMENT_LINUX: >
+            LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib
+            CMAKE_PREFIX_PATH=/usr/local
+
+          # Repair step bundles liboqs.so + libssl/libcrypto into the wheel
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair -w {dest_dir}
+              --plat manylinux_2_28_x86_64 {wheel}
+
+          # Smoke test inside the container after building
+          CIBW_TEST_COMMAND: >
+            python -c "import qpqt; pub, sec = qpqt.keygen(); print('wheel OK, keygen produced', len(pub), 'byte public key')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  # Optional: publish to PyPI when a version tag is pushed.
+  # Requires a PyPI API token stored as the secret PYPI_API_TOKEN,
+  # or Trusted Publishing configured on PyPI (preferred, no token needed).
+  publish:
+    name: Publish to PyPI
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write   # for PyPI Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # With Trusted Publishing set up on PyPI, no token is needed.
+        # Otherwise uncomment and set the secret:
+        # with:
+        #   password: ${{ secrets.PYPI_API_TOKEN }}
