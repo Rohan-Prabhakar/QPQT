@@ -1,7 +1,7 @@
 # QPQT - Quantum-Safe Columnar Storage Format
 
 A purpose-built binary columnar file format (`.qpqt`) with native
-post-quantum cryptography and row-granular lazy decryption - a capability
+post-quantum cryptography and row-granular lazy decryption a capability
 no existing columnar format offers.
 
 **Cryptographic stack:** ML-KEM-768 (FIPS 203) + HKDF-SHA3-256 + AES-256-GCM (FIPS 197)
@@ -247,25 +247,6 @@ the CLI, Python bindings, and Arrow export rather than reading `.qpqt` natively.
 QPQT stores a `key_id` reference in the file header, not the key itself, so key
 rotation never requires rewriting existing data files.
 
-## Test Coverage
-
-39 tests across correctness, cryptography, lazy decryption, performance, edge
-cases, and key persistence:
-
-| Category | What they verify |
-|---|---|
-| Correctness | Write/read roundtrip at 1, 4095, 4096, 4097, 100K, 100001, 1M rows |
-| Cryptographic | Wrong key fails, tamper detection, manifest count, IV uniqueness, cross-file IV |
-| Lazy decryption | 0% / 5% / 100% selectivity section-2 read tracking |
-| Performance | Write throughput, structural scan, selectivity sweep |
-| Edge cases | All-PQC schema, empty file, truncated file, NULL values |
-| End-to-end | Real ML-KEM keypairs, page boundary, row-group boundary, 1M random access |
-| Key persistence | Keys survive disk roundtrip; write/read across separate processes |
-
-```bash
-./build/qpqt_tests      # run all 39 tests
-./build/qpqt_bench      # reproduce the performance table
-```
 
 ## Build
 
