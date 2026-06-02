@@ -1,7 +1,7 @@
 # QPQT - Quantum-Safe Columnar Storage Format
 
 A purpose-built binary columnar file format (`.qpqt`) with native
-post-quantum cryptography and row-granular lazy decryption a capability
+post-quantum cryptography and row-granular lazy decryption, a capability
 no existing columnar format offers.
 
 **Cryptographic stack:** ML-KEM-768 (FIPS 203) + HKDF-SHA3-256 + AES-256-GCM (FIPS 197)
