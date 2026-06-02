@@ -55,7 +55,7 @@ qpqt_ext = Extension(
 
 setup(
     name="qpqt",
-    version="0.1.0",
+    version="0.1.1",
     author="Rohan Prabhakar",
     description="Quantum-Safe Columnar Storage Format with row-granular lazy decryption (Python bindings)",
     long_description=open("README.md").read(),

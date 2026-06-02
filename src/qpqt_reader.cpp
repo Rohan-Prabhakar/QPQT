@@ -303,6 +303,9 @@ private:
                         throw std::runtime_error("Manifest index out of range");
 
                     auto& me = manifest_[manifest_idx];
+                    if (!has_secret_key_)
+                        throw std::runtime_error(
+                            "PQC column requires secret key — call set_secret_key() first");
                     uint8_t ss[crypto::ML_KEM_768_SS_LEN];
                     crypto::kem_decapsulate(secret_key_, me.kem_ciphertext, ss);
                     crypto::derive_page_key(

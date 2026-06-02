@@ -21,6 +21,7 @@
 #include <set>
 #include <array>
 #include <stdexcept>
+#include <unistd.h>
 #include "qpqt_types.h"
 #include "qpqt_utils.h"
 #include "qpqt_crypto.h"
@@ -272,9 +273,23 @@ void test_crypto() {
 void test_lazy() {
     current_group = "Lazy Decryption";
 
+    // Write a shared encrypted file for TC-13/14/15
+    auto schema = make_schema();
+    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN];
+    kem_keygen(pk, sk);
+    {
+        std::vector<int32_t> ids(100000);
+        std::vector<std::string> ssns(100000);
+        for (int i = 0; i < 100000; ++i) { ids[i]=i; ssns[i]="SSN-"+std::to_string(i); }
+        QpqtWriter w("/tmp/t_lazy.qpqt", schema, TEST_KEY_ID, pk);
+        w.write_row_group(100000, {pack_int32_column(ids)}, {ssns});
+        w.finalize();
+    }
+
     // TC-13: 0% selectivity → section 2 never read
     {
-        QpqtReader r("/tmp/t05.qpqt");
+        QpqtReader r("/tmp/t_lazy.qpqt");
+        r.set_secret_key(sk);
         uint64_t s2=0;
         auto res = r.query({{0,[](int32_t v){return v>999999;}}}, s2);
         ASSERT(res.empty(), "TC-13: 0% selectivity → 0 results");
@@ -283,7 +298,8 @@ void test_lazy() {
 
     // TC-14: 5% selectivity → partial section 2 read
     {
-        QpqtReader r("/tmp/t05.qpqt");
+        QpqtReader r("/tmp/t_lazy.qpqt");
+        r.set_secret_key(sk);
         uint64_t s2=0;
         auto res = r.query({{0,[](int32_t v){return v%20==0;}}}, s2);
         ASSERT(res.size()==5000, "TC-14: 5% → 5000 survivors");
@@ -292,7 +308,8 @@ void test_lazy() {
 
     // TC-15: 100% selectivity → full section 2 read
     {
-        QpqtReader r("/tmp/t05.qpqt");
+        QpqtReader r("/tmp/t_lazy.qpqt");
+        r.set_secret_key(sk);
         uint64_t s2=0;
         auto res = r.query({}, s2);
         ASSERT(res.size()==100000, "TC-15: 100% → 100K results");
@@ -579,23 +596,31 @@ int main() {
     std::cout << "=== QPQT Test Suite ===\n";
     std::cout << "ML-KEM-768 + HKDF-SHA3-256 + AES-256-GCM\n\n";
 
+#define RUN(fn) do { \
+        try { fn(); } \
+        catch (std::exception& e) { \
+            std::cerr << "  FATAL in " #fn ": " << e.what() << "\n"; \
+            ++tests_failed; \
+        } \
+    } while(0)
+
     std::cout << "── Correctness Tests ──\n";
-    test_correctness();
+    RUN(test_correctness);
 
     std::cout << "\n── Cryptographic Tests ──\n";
-    test_crypto();
+    RUN(test_crypto);
 
     std::cout << "\n── Lazy Decryption Tests ──\n";
-    test_lazy();
+    RUN(test_lazy);
 
     std::cout << "\n── End-to-End Tests ──\n";
-    test_e2e();
+    RUN(test_e2e);
 
     std::cout << "\n── Edge Case Tests ──\n";
-    test_edge_cases();
+    RUN(test_edge_cases);
 
     std::cout << "\n── Key Persistence Tests ──\n";
-    test_key_persistence();
+    RUN(test_key_persistence);
 
     std::cout << "\n════════════════════════════════\n";
     std::cout << "Tests passed : " << tests_passed << "\n";
