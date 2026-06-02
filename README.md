@@ -4,49 +4,24 @@ A purpose-built binary columnar file format (`.qpqt`) with native
 post-quantum cryptography and row-granular lazy decryption, a capability
 no existing columnar format offers.
 
-**Cryptographic stack:** ML-KEM-768 (FIPS 203) + HKDF-SHA3-256 + AES-256-GCM (FIPS 197)
+**Cryptographic stack:** ML-KEM-768 (FIPS 203) + HKDF-SHA-256 + AES-256-GCM (FIPS 197)
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies (liboqs + OpenSSL)
-bash scripts/install_deps.sh
-
-# 2. Build
-mkdir build && cd build && cmake .. && make -j$(nproc) && cd ..
-
-# 3. Generate a quantum-safe keypair
-./build/qpqt keygen --out-pub pub.bin --out-sec sec.bin
-
-# 4. Encrypt a CSV - ssn and dob become quantum-safe encrypted columns
-./build/qpqt encrypt \
-    --input customers.csv \
-    --pqc-columns ssn,dob \
-    --pub-key pub.bin \
-    --output customers.qpqt
-
-# 5. Inspect the file (no keys required - safe to run anywhere)
-./build/qpqt inspect --input customers.qpqt
-
-# 6. Decrypt for authorized users (lazy - only matching rows decrypted)
-./build/qpqt decrypt \
-    --input customers.qpqt \
-    --sec-key sec.bin \
-    --where "customer_id=12345" \
-    --output result.csv
+pip install qpqt
 ```
 
-Python:
-
 ```python
-import qpqt, pandas as pd
+import qpqt
 
+# Generate a quantum-safe keypair
 pub, sec = qpqt.keygen()
 kid = qpqt.generate_key_id()
 
-# Write
+# Encrypt - ssn column is ML-KEM-768 + AES-256-GCM protected
 w = qpqt.Writer("customers.qpqt",
                 column_names=["id", "state", "ssn"],
                 column_types=["int32", "string", "string"],
@@ -58,8 +33,10 @@ w.close()
 # Read - lazy decryption, only matching rows decrypted
 r = qpqt.Reader("customers.qpqt")
 r.set_secret_key(sec)
-df = pd.DataFrame(r.query(where={"id": 2}))
+data = r.query(where={"id": 2})
 ```
+
+The wheel bundles liboqs and OpenSSL. No system dependencies needed.
 
 ---
 
@@ -100,9 +77,9 @@ Two baselines are measured, not estimated:
 
 - **Naive per-row PQC** - row-level ML-KEM encapsulation. Establishes the upper
   bound of the problem. This is what a quick `liboqs` integration produces.
-- **Competent per-page PQC** - the *correct* hybrid KEM construction (per-page
+- **Competent per-page PQC** - the correct hybrid KEM construction (per-page
   ML-KEM + AES-GCM, exactly like QPQT) but stored in a plain layout with no
-  column separation and no lazy decryption. It decrypts every row in the queried
+  column separation and no lazy decryption. Decrypts every row in the queried
   column because decryption is chunk-granular. This isolates QPQT's actual
   contribution.
 
@@ -115,22 +92,12 @@ Two baselines are measured, not estimated:
 | 50%  | 9,600ms | 2,148ms | **1,055ms** | **2.0x**  |
 | 100% | 9,600ms | 2,147ms | **2,098ms** | **1.02x (no advantage)** |
 
-**Reading this table honestly:**
-
-QPQT's contribution is *row-granular lazy decryption*. At low selectivity -
-the common case for analytical queries - it decrypts orders of magnitude fewer
-rows than a competent columnar-unaware implementation, giving 8-27x.
-
-As selectivity approaches 100%, the advantage shrinks to parity: when every row
-survives the predicate, QPQT and the competent baseline do identical work. **At
-100% selectivity QPQT offers no advantage over competent per-page PQC** - and
-that is expected, because there is nothing to skip.
-
-The win is real precisely where real queries live: selective filters on large
-tables. It is not a universal speedup, and the methodology isolates exactly
-what QPQT adds versus what any competent PQC implementation would already do.
-
-Other measured numbers:
+QPQT's contribution is row-granular lazy decryption. At low selectivity - the
+common case for analytical queries - it decrypts far fewer rows than a
+competent columnar-unaware implementation, giving 8-27x. As selectivity
+approaches 100%, the advantage shrinks to parity. **At 100% selectivity QPQT
+offers no advantage over competent per-page PQC** - when every row survives the
+predicate, there is nothing to skip.
 
 | Metric | Value |
 |---|---|
@@ -149,7 +116,7 @@ ML-KEM-768 keypair  ->  secret key stored in KMS (file holds only key_id)
                             |-- kem_ciphertext  ->  CRYPTO MANIFEST
                             +-- shared_secret (32 bytes)
                                         |
-                                HKDF-SHA3-256(shared_secret, page_context)
+                                HKDF-SHA-256(shared_secret, page_context)
                                         +-- aes_page_key (32 bytes, unique per page)
                                                     |
                                             AES-256-GCM per row
@@ -162,7 +129,7 @@ ML-KEM-768 keypair  ->  secret key stored in KMS (file holds only key_id)
 
 QPQT uses deterministic AES-GCM IVs. **This is safe because nonce uniqueness is
 guaranteed within every key scope.** Each 4,096-row page derives its own unique
-AES-256 key via ML-KEM encapsulation + HKDF-SHA3-256. The IV only needs to be
+AES-256 key via ML-KEM encapsulation + HKDF-SHA-256. The IV only needs to be
 unique under a given key, and within a single page key the `(row_index,
 column_index)` tuple is unique by construction. The `file_uuid` component
 prevents cross-file collision in the event a page key is ever reused across
@@ -173,29 +140,33 @@ All components are NIST-approved and quantum-safe:
 - ML-KEM-768: FIPS 203 (replaces RSA/ECDH for key establishment)
 - AES-256-GCM: FIPS 197 (quantum-safe symmetrically; Grover's only halves the
   effective key strength, leaving 128-bit security)
-- HKDF-SHA3-256: SP 800-56C
+- HKDF-SHA-256: RFC 5869 / SP 800-56C
 
 ## Why a Separate Format (and not Parquet)?
 
-A reasonable question: Parquet already has Modular Encryption - why not derive
-its AES key from ML-KEM and get quantum-safe Parquet today?
+Parquet already has Modular Encryption - why not derive its AES key from ML-KEM
+and get quantum-safe Parquet today?
 
-For *encryption alone*, you could. Parquet Modular Encryption does per-column
-AES-GCM and you could wrap the key with ML-KEM. **The encryption is not the
-contribution.**
+For encryption alone, you could. The encryption is not the contribution.
 
-The contribution is **row-granular lazy decryption**. Parquet does support
-predicate pushdown and can skip entire encrypted column chunks or row groups via
-footer statistics - that is real and valuable. What it cannot do is decrypt only
-the *surviving rows within a chunk* that the predicate did not eliminate
-wholesale. Parquet decrypts at **chunk granularity**, not **surviving-row
-granularity**. Closing that specific gap is what requires a format where
-structural columns are physically separated (so the predicate runs before any
-decryption) and where a manifest addresses individual rows' page keys.
+The contribution is row-granular lazy decryption. Parquet supports predicate
+pushdown and can skip entire encrypted column chunks via footer statistics.
+What it cannot do is decrypt only the surviving rows within a chunk that the
+predicate did not eliminate wholesale. Parquet decrypts at chunk granularity,
+not surviving-row granularity. Closing that gap requires physically separated
+structural columns and a per-row-addressable key manifest - a different file
+layout.
 
-QPQT is a purpose-built format for organizations that need PQC-protected
-columnar data with row-granular lazy decryption. Existing tools integrate via
-the CLI, Python bindings, and Arrow export rather than reading `.qpqt` natively.
+The three conditions no existing format satisfies simultaneously:
+
+1. Structural columns physically separated from encrypted columns at OS-page
+   boundaries, so the filter never pages the encrypted section into cache.
+2. Every row's decryption key addressable in O(1) without decrypting anything
+   first - the flat manifest in the footer.
+3. Decryption expressible at single-row granularity within a page. Parquet
+   treats the chunk as an atomic encrypted unit.
+
+The idea is simple. The format that makes it executable is the contribution.
 
 ## File Format
 
@@ -227,13 +198,20 @@ the CLI, Python bindings, and Arrow export rather than reading `.qpqt` natively.
 ## Key Management
 
 ```bash
+# Python
+pub, sec = qpqt.keygen()
+kid = qpqt.generate_key_id()
+
+# CLI (build from source)
 ./qpqt keygen --out-pub pub.bin --out-sec sec.bin
 ```
 
-- `pub.bin` - ML-KEM-768 public key (1184 bytes). Safe to share with writers.
-- `sec.bin` - ML-KEM-768 secret key (2400 bytes). **Never share. Never commit.**
-- `pub.bin.keyid` - 16-byte key ID. Pass to `--key-id` when encrypting.
+- Public key (1184 bytes) - safe to share with writers.
+- Secret key (2400 bytes) - **never share, never commit.**
+- Key ID (16 bytes) - stored in the file header, not the key itself.
 
+**If you lose the secret key, data encrypted with its public key is permanently
+unrecoverable.**
 
 | Environment | Recommended key storage |
 |---|---|
@@ -244,32 +222,37 @@ the CLI, Python bindings, and Arrow export rather than reading `.qpqt` natively.
 | Databricks | `dbutils.secrets` |
 | On-premise | HashiCorp Vault or HSM |
 
-QPQT stores a `key_id` reference in the file header, not the key itself, so key
-rotation never requires rewriting existing data files.
+Key rotation never requires rewriting existing data files - QPQT stores a
+`key_id` reference in the header, not the key itself.
 
 
-## Build
+## Build from Source
 
-### Prerequisites
-- Ubuntu 22.04 or Debian 12
-- CMake 3.16+, OpenSSL 3.x, C++17 compiler with OpenMP
+For CLI usage or contributing:
 
-### Steps
 ```bash
-bash scripts/install_deps.sh        # installs liboqs from source
+# Prerequisites: Ubuntu 22.04+, CMake 3.16+, C++17, OpenSSL dev headers
+bash scripts/install_deps.sh   # builds liboqs from source
 mkdir build && cd build
 cmake .. && make -j$(nproc)
-./qpqt_tests
+./qpqt_tests                   # run all 39 tests
+./qpqt_bench                   # reproduce the benchmark table
 ```
 
 ## Ecosystem Integration
 
 | Tool | How |
 |---|---|
-| CLI | `qpqt encrypt/decrypt/inspect` on CSV (Parquet with Arrow build) |
-| Python / pandas | `pip install .` then `import qpqt` |
+| Python / pandas | `pip install qpqt` |
+| CLI | `qpqt encrypt/decrypt/inspect` on CSV or Parquet (build from source) |
 | DuckDB / Polars / Spark | `qpqt_arrow export` produces structural columns as Arrow IPC |
 
+## Roadmap
+
+- **v0.1 (current):** PyPI wheel, full crypto stack, CLI, Python bindings, Arrow export, 39 tests
+- **v0.2:** pandas `read_qpqt` / `to_qpqt` one-liners, Parquet read/write in CLI, DuckDB recipe
+- **v1.0:** Spark DataSource connector, ML-DSA-65 metadata signatures, threat model doc
+- **v2.0:** Distributed operation, S3/Azure direct integration
 
 ## License
 
