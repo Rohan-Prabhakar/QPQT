@@ -40,10 +40,8 @@ class QpqtBuildExt(build_ext):
 
         ext.extra_compile_args += ["-O3", "-std=c++17"]
 
-        # manylinux containers install liboqs to lib64; local dev often lib.
-        # Include both so the build finds liboqs.so wherever it landed.
+        # liboqs is built statically so no runtime_library_dirs needed.
         ext.library_dirs += ["/usr/local/lib64", "/usr/local/lib"]
-        ext.runtime_library_dirs += ["/usr/local/lib64", "/usr/local/lib"]
         ext.libraries += ["oqs", "ssl", "crypto"]
 
         super().build_extension(ext)

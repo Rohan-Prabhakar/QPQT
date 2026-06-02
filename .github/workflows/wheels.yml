@@ -27,27 +27,20 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
 
           # Build liboqs from source against the container's stock OpenSSL.
-          # qpqt_crypto.h now uses only HMAC primitives (OpenSSL 1.1.1+
-          # compatible) so no need to build OpenSSL from source.
           CIBW_BEFORE_ALL_LINUX: >
-            yum install -y git gcc gcc-c++ make openssl-devel &&
-            pip install cmake ninja &&
+            dnf install -y git gcc gcc-c++ make cmake ninja-build openssl-devel &&
             git clone --depth 1
             https://github.com/open-quantum-safe/liboqs /tmp/liboqs &&
             cmake -GNinja -S /tmp/liboqs -B /tmp/liboqs/build
             -DOQS_DIST_BUILD=ON
             -DCMAKE_INSTALL_PREFIX=/usr/local
             -DCMAKE_BUILD_TYPE=Release
-            -DBUILD_SHARED_LIBS=ON &&
+            -DBUILD_SHARED_LIBS=OFF &&
             cmake --build /tmp/liboqs/build --target install
 
           CIBW_ENVIRONMENT_LINUX: >
             LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib
             CMAKE_PREFIX_PATH=/usr/local
-
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
-            LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib
-            auditwheel repair -w {dest_dir} {wheel}
 
           CIBW_TEST_COMMAND: >
             python -c "

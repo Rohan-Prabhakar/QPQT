@@ -1,18 +1,6 @@
 /**
  * qpqt_reader.cpp
- * Week 2 scope: footer-first read path, schema parsing,
- * structural column reading, lazy decryption stub.
- * Full AES-256-GCM decryption wired in Week 3.
  *
- * Read path per spec section 10:
- * Step 1: seek to end, read FOOTER HEADER
- * Step 2: verify magic + CRC32
- * Step 3: read ROW GROUP OFFSET TABLE
- * Step 4: identify target row groups
- * Step 5: pread() SECTION 1 only
- * Step 6: apply predicates → survivor_indices[]
- * Step 7: if empty → return, never touch SECTION 2
- * Step 8: for survivors → decrypt (stub in Week 2)
  */
 
 #include "../include/qpqt_types.h"
@@ -83,7 +71,6 @@ public:
     uint64_t               total_rows() const { return file_hdr_.total_rows; }
 
     // Scan all row groups, apply predicates on structural columns,
-    // return matching rows with PQC values (stub decrypted in Week 2)
     std::vector<QpqtResultRow> query(
         const std::vector<QpqtPredicate>& predicates,
         uint64_t& out_section2_bytes_read
@@ -143,7 +130,6 @@ private:
     bool                    has_secret_key_ = false;
     crypto::PageKeyCache    page_key_cache_;
 
-    // ── Footer reading (Step 1-2 of read path) ──
 
     void read_and_verify_footer() {
         // Seek to end, get file size
@@ -181,8 +167,7 @@ private:
         // Step 3: read ROW GROUP OFFSET TABLE
         file_.seekg(footer_hdr_.offset_table_offset);
         uint32_t rg_count = file_hdr_.row_group_count; // not yet read
-        // We compute rg_count from manifest: manifest_entries / pqc_cols / pages
-        // Actually read until manifest_offset
+       
         uint64_t ot_bytes = footer_hdr_.manifest_offset
                           - footer_hdr_.offset_table_offset;
         uint32_t ot_count = (uint32_t)(ot_bytes / QpqtRGOffsetEntry::SIZE);
@@ -705,8 +690,9 @@ private:
 #include "qpqt_writer.cpp"
 
 // ─────────────────────────────────────────────────────────
-// Test harness
+// Test harness (excluded when included from Python bindings)
 // ─────────────────────────────────────────────────────────
+#ifndef QPQT_READER_NO_MAIN
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -950,3 +936,5 @@ int main() {
     run_reader_tests();
     return tests_failed > 0 ? 1 : 0;
 }
+
+#endif // QPQT_READER_NO_MAIN
