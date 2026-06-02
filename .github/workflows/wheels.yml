@@ -26,41 +26,44 @@ jobs:
           CIBW_SKIP: "*-musllinux*"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
 
-          # The manylinux_2_28 image ships OpenSSL 1.1.1, but qpqt_crypto.h
-          # uses the OpenSSL 3.0 EVP_KDF / OSSL_PARAM HKDF API. So we build
-          # OpenSSL 3.x from source into /usr/local first, then build liboqs
-          # against it, then the extension compiles against 3.x too.
+          # Build liboqs from source against the container's stock OpenSSL.
+          # qpqt_crypto.h now uses only HMAC primitives (OpenSSL 1.1.1+
+          # compatible) so no need to build OpenSSL from source.
           CIBW_BEFORE_ALL_LINUX: >
-            yum install -y git gcc gcc-c++ make perl-IPC-Cmd perl-Data-Dumper &&
+            yum install -y git gcc gcc-c++ make openssl-devel &&
             pip install cmake ninja &&
-            curl -sSL https://www.openssl.org/source/openssl-3.0.15.tar.gz -o /tmp/openssl.tar.gz &&
-            tar xf /tmp/openssl.tar.gz -C /tmp &&
-            cd /tmp/openssl-3.0.15 &&
-            ./Configure --prefix=/usr/local --openssldir=/usr/local/ssl shared zlib &&
-            make -j"$(nproc)" &&
-            make install_sw &&
-            cd / &&
-            git clone --depth 1 https://github.com/open-quantum-safe/liboqs /tmp/liboqs &&
+            git clone --depth 1
+            https://github.com/open-quantum-safe/liboqs /tmp/liboqs &&
             cmake -GNinja -S /tmp/liboqs -B /tmp/liboqs/build
             -DOQS_DIST_BUILD=ON
             -DCMAKE_INSTALL_PREFIX=/usr/local
             -DCMAKE_BUILD_TYPE=Release
-            -DBUILD_SHARED_LIBS=ON
-            -DOPENSSL_ROOT_DIR=/usr/local &&
+            -DBUILD_SHARED_LIBS=ON &&
             cmake --build /tmp/liboqs/build --target install
 
           CIBW_ENVIRONMENT_LINUX: >
             LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib
             CMAKE_PREFIX_PATH=/usr/local
-            OPENSSL_ROOT_DIR=/usr/local
-            PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
 
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib
             auditwheel repair -w {dest_dir} {wheel}
 
           CIBW_TEST_COMMAND: >
-            python -c "import qpqt; pub, sec = qpqt.keygen(); print('wheel OK,', len(pub), 'byte public key')"
+            python -c "
+            import qpqt;
+            pub, sec = qpqt.keygen();
+            kid = qpqt.generate_key_id();
+            w = qpqt.Writer('/tmp/test.qpqt',
+                ['id','ssn'],['int32','string'],['ssn'],pub,kid);
+            w.write_batch({'id':[1,2,3],'ssn':['A','B','C']},3);
+            w.close();
+            r = qpqt.Reader('/tmp/test.qpqt');
+            r.set_secret_key(sec);
+            d = r.query();
+            assert d['ssn'][0]=='A', 'roundtrip failed';
+            print('wheel OK — keygen, write, read, decrypt all passed')
+            "
 
       - uses: actions/upload-artifact@v4
         with:
