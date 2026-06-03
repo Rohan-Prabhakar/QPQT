@@ -215,6 +215,52 @@ static_assert(sizeof(QpqtFooterHeader) == 40, "FooterHeader must be 40 bytes");
 #pragma pack(pop)
 
 // ─────────────────────────────────────────────────────────
+// Typed structural column value (C++17 variant)
+// ─────────────────────────────────────────────────────────
+
+#include <variant>
+#include <optional>
+
+using QpqtScalarValue = std::variant<
+    int32_t,      // INT32, DATE32
+    int64_t,      // INT64
+    float,        // FLOAT32
+    double,       // FLOAT64
+    std::string   // STRING (structural)
+>;
+
+struct QpqtColValue {
+    QpqtColumnType  type;
+    bool            is_null = false;
+    QpqtScalarValue value   = int32_t{0};
+};
+
+// ─────────────────────────────────────────────────────────
+// Query result row — typed structural + PQC values
+// ─────────────────────────────────────────────────────────
+
+struct QpqtResultRow {
+    uint64_t                  row_index;
+    // INT32 values in schema order — retained for API compatibility
+    std::vector<int32_t>      int32_values;
+    // New: all structural columns typed, in schema order (non-pqc cols only)
+    std::vector<QpqtColValue> structural_values;
+    // PQC columns (decrypted strings) in schema order
+    std::vector<std::string>  pqc_values;
+};
+
+// ─────────────────────────────────────────────────────────
+// Predicate on a structural column (used by QpqtReader::query)
+// ─────────────────────────────────────────────────────────
+
+#include <functional>
+
+struct QpqtPredicate {
+    uint16_t col_index;
+    std::function<bool(int32_t)> test;  // value cast to int32 for comparison
+};
+
+// ─────────────────────────────────────────────────────────
 // In-memory row batch (used by writer)
 // ─────────────────────────────────────────────────────────
 

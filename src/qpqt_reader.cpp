@@ -19,21 +19,7 @@
 
 using namespace qpqt;
 
-// ─────────────────────────────────────────────────────────
-// Query result row
-// ─────────────────────────────────────────────────────────
-
-struct QpqtResultRow {
-    uint64_t                     row_index;
-    std::vector<int32_t>         int32_values;   // per structural INT32 col
-    std::vector<std::string>     pqc_values;     // per PQC col (decrypted)
-};
-
-// Predicate on a structural INT32 column
-struct QpqtPredicate {
-    uint16_t col_index;                          // column index in schema
-    std::function<bool(int32_t)> test;
-};
+// QpqtResultRow, QpqtColValue, QpqtPredicate defined in qpqt_types.h
 
 // ─────────────────────────────────────────────────────────
 // QpqtReader
@@ -50,12 +36,6 @@ public:
         read_schema();
         read_key_reference();
 
-        std::cout << "[reader] Opened " << path << "\n"
-                  << "  total_rows="    << file_hdr_.total_rows
-                  << " rg_count="       << file_hdr_.row_group_count
-                  << " pqc_cols="       << footer_hdr_.pqc_column_count
-                  << " manifest_entries=" << footer_hdr_.manifest_entry_count
-                  << "\n";
     }
 
     // ── Public API ──
@@ -70,26 +50,66 @@ public:
     const QpqtFileHeader&  file_header()const { return file_hdr_; }
     uint64_t               total_rows() const { return file_hdr_.total_rows; }
 
-    // Scan all row groups, apply predicates on structural columns,
+    // Scan row groups, apply predicates on structural columns,
+    // optionally starting at start_row and returning at most max_rows results.
+    // start_row=0, max_rows=UINT64_MAX means scan everything (default behaviour).
     std::vector<QpqtResultRow> query(
         const std::vector<QpqtPredicate>& predicates,
-        uint64_t& out_section2_bytes_read
+        uint64_t& out_section2_bytes_read,
+        uint64_t   start_row = 0,
+        uint64_t   max_rows  = UINT64_MAX
     ) {
         out_section2_bytes_read = 0;
         std::vector<QpqtResultRow> results;
+        uint64_t rows_seen   = 0; // absolute row index across all RGs
+        uint64_t rows_emitted = 0;
 
         for (auto& oe : rg_offsets_) {
             // Read row count from RG header before any other seek
             file_.seekg(oe.file_byte_offset);
             QpqtRowGroupHeader rg_hdr;
             file_.read(reinterpret_cast<char*>(&rg_hdr), QpqtRowGroupHeader::SIZE);
+            uint64_t rg_row_count = rg_hdr.row_count;
+
+            // Skip this RG entirely if it falls before start_row
+            if (rows_seen + rg_row_count <= start_row) {
+                rows_seen += rg_row_count;
+                continue;
+            }
+
             auto rg_results = query_row_group(
-                oe, rg_hdr.row_count, predicates, out_section2_bytes_read
+                oe, (uint32_t)rg_row_count, predicates, out_section2_bytes_read
             );
-            results.insert(results.end(),
-                           rg_results.begin(), rg_results.end());
+
+            for (auto& r : rg_results) {
+                if (r.row_index < start_row) continue;
+                results.push_back(std::move(r));
+                if (++rows_emitted >= max_rows) return results;
+            }
+
+            rows_seen += rg_row_count;
+            if (rows_emitted >= max_rows) break;
         }
         return results;
+    }
+
+    // Stream all matching rows through a callback — O(N) single pass,
+    // no result vector stored. Used by benchmarks and DuckDB scan.
+    uint64_t query_count(
+        const std::vector<QpqtPredicate>& predicates,
+        uint64_t& out_section2_bytes_read
+    ) {
+        out_section2_bytes_read = 0;
+        uint64_t count = 0;
+        for (auto& oe : rg_offsets_) {
+            file_.seekg(oe.file_byte_offset);
+            QpqtRowGroupHeader rg_hdr;
+            file_.read(reinterpret_cast<char*>(&rg_hdr), QpqtRowGroupHeader::SIZE);
+            auto rg_results = query_row_group(
+                oe, rg_hdr.row_count, predicates, out_section2_bytes_read);
+            count += rg_results.size();
+        }
+        return count;
     }
 
     // Read a single row by absolute index (for TC-07)
@@ -166,7 +186,7 @@ private:
 
         // Step 3: read ROW GROUP OFFSET TABLE
         file_.seekg(footer_hdr_.offset_table_offset);
-        uint32_t rg_count = file_hdr_.row_group_count; // not yet read
+        uint32_t rg_count = file_hdr_.row_group_count; // unused — count derived from offset table size
        
         uint64_t ot_bytes = footer_hdr_.manifest_offset
                           - footer_hdr_.offset_table_offset;
@@ -492,31 +512,63 @@ private:
 
             if (ptr + byte_len > end) break;
 
-            if (schema_.columns[col_idx].type == QpqtColumnType::INT32) {
+            // Store pointer for any structural type — predicate application
+            // dispatches on type below
+            if (!schema_.columns[col_idx].is_pqc_encrypted) {
                 col_data[col_idx] = reinterpret_cast<const int32_t*>(ptr);
-                col_row_counts[col_idx] = (uint32_t)(byte_len / 4);
+                if (schema_.columns[col_idx].type == QpqtColumnType::INT32 ||
+                    schema_.columns[col_idx].type == QpqtColumnType::DATE32)
+                    col_row_counts[col_idx] = (uint32_t)(byte_len / 4);
+                else if (schema_.columns[col_idx].type == QpqtColumnType::INT64)
+                    col_row_counts[col_idx] = (uint32_t)(byte_len / 8);
+                else if (schema_.columns[col_idx].type == QpqtColumnType::FLOAT32)
+                    col_row_counts[col_idx] = (uint32_t)(byte_len / 4);
+                else if (schema_.columns[col_idx].type == QpqtColumnType::FLOAT64)
+                    col_row_counts[col_idx] = (uint32_t)(byte_len / 8);
+                else
+                    col_row_counts[col_idx] = rg_row_count; // STRING: row count from header
             }
             ptr += byte_len;
             ++cols_parsed;
         }
 
-        // Apply predicates row by row
+        // Apply predicates row by row — dispatch on column type
         for (uint32_t r = 0; r < rg_row_count; ++r) {
             bool pass = true;
             for (auto& pred : predicates) {
-                if (col_data[pred.col_index] == nullptr) continue;
-                if (r >= col_row_counts[pred.col_index]) { pass=false; break; }
-                if (!pred.test(col_data[pred.col_index][r])) {
-                    pass = false;
-                    break;
+                uint16_t ci = pred.col_index;
+                if (ci >= schema_.column_count) continue;
+                if (col_data[ci] == nullptr) continue;
+                if (r >= col_row_counts[ci]) { pass = false; break; }
+                const uint8_t* base = reinterpret_cast<const uint8_t*>(col_data[ci]);
+                int32_t val_i32 = 0;
+                switch (schema_.columns[ci].type) {
+                    case QpqtColumnType::INT32:
+                    case QpqtColumnType::DATE32:
+                        memcpy(&val_i32, base + r * 4, 4);
+                        break;
+                    case QpqtColumnType::INT64: {
+                        int64_t v; memcpy(&v, base + r * 8, 8);
+                        val_i32 = (int32_t)v; break; // cast for predicate
+                    }
+                    case QpqtColumnType::FLOAT32: {
+                        float v; memcpy(&v, base + r * 4, 4);
+                        val_i32 = (int32_t)v; break;
+                    }
+                    case QpqtColumnType::FLOAT64: {
+                        double v; memcpy(&v, base + r * 8, 8);
+                        val_i32 = (int32_t)v; break;
+                    }
+                    default: continue; // STRING predicates not yet supported
                 }
+                if (!pred.test(val_i32)) { pass = false; break; }
             }
             if (pass) survivors.push_back(r);
         }
         return survivors;
     }
 
-    // ── INT32 value extractor for result rows ──
+    // ── Structural value extractor — all types ────────────────────────────────
 
     void extract_int32_values(
         const std::vector<uint8_t>& s1_data,
@@ -534,17 +586,79 @@ private:
             memcpy(&col_idx,  ptr,     2);
             memcpy(&byte_len, ptr + 2, 8);
             ptr += 10;
-
             if (ptr + byte_len > end) break;
-
-            if (col_idx < schema_.column_count &&
-                schema_.columns[col_idx].type == QpqtColumnType::INT32) {
-                const int32_t* data = reinterpret_cast<const int32_t*>(ptr);
-                uint32_t n_rows = (uint32_t)(byte_len / 4);
-                if (row_in_rg < n_rows) {
-                    out_row.int32_values.push_back(data[row_in_rg]);
-                }
+            if (col_idx >= schema_.column_count ||
+                schema_.columns[col_idx].is_pqc_encrypted) {
+                ptr += byte_len; continue;
             }
+
+            auto& coldef = schema_.columns[col_idx];
+            QpqtColValue cv;
+            cv.type    = coldef.type;
+            cv.is_null = false;
+
+            switch (coldef.type) {
+                case QpqtColumnType::INT32:
+                case QpqtColumnType::DATE32: {
+                    uint32_t n = (uint32_t)(byte_len / 4);
+                    if (row_in_rg < n) {
+                        int32_t v;
+                        memcpy(&v, ptr + row_in_rg * 4, 4);
+                        cv.value = v;
+                        out_row.int32_values.push_back(v); // preserved for API compatibility
+                    }
+                    break;
+                }
+                case QpqtColumnType::INT64: {
+                    uint32_t n = (uint32_t)(byte_len / 8);
+                    if (row_in_rg < n) {
+                        int64_t v;
+                        memcpy(&v, ptr + row_in_rg * 8, 8);
+                        cv.value = v;
+                    }
+                    break;
+                }
+                case QpqtColumnType::FLOAT32: {
+                    uint32_t n = (uint32_t)(byte_len / 4);
+                    if (row_in_rg < n) {
+                        float v;
+                        memcpy(&v, ptr + row_in_rg * 4, 4);
+                        cv.value = v;
+                    }
+                    break;
+                }
+                case QpqtColumnType::FLOAT64: {
+                    uint32_t n = (uint32_t)(byte_len / 8);
+                    if (row_in_rg < n) {
+                        double v;
+                        memcpy(&v, ptr + row_in_rg * 8, 8);
+                        cv.value = v;
+                    }
+                    break;
+                }
+                case QpqtColumnType::STRING: {
+                    // Length-prefix encoded: walk to row_in_rg-th value
+                    const uint8_t* p = ptr;
+                    const uint8_t* col_end = ptr + byte_len;
+                    uint32_t cur = 0;
+                    while (p + 4 <= col_end && cur <= row_in_rg) {
+                        uint32_t slen;
+                        memcpy(&slen, p, 4);
+                        p += 4;
+                        if (p + slen > col_end) break;
+                        if (cur == row_in_rg) {
+                            cv.value = std::string(
+                                reinterpret_cast<const char*>(p), slen);
+                            break;
+                        }
+                        p += slen;
+                        ++cur;
+                    }
+                    break;
+                }
+                default: break;
+            }
+            out_row.structural_values.push_back(cv);
             ptr += byte_len;
         }
     }

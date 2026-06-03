@@ -117,9 +117,15 @@ public:
             QpqtColumnSchema col;
             col.name = col_names[i];
             col.is_pqc_encrypted = pqc_set.count(col_names[i]) > 0;
-            col.type = (col_types[i] == "int32")
-                     ? QpqtColumnType::INT32
-                     : QpqtColumnType::STRING;
+
+            const auto& t = col_types[i];
+            if      (t == "int32")   col.type = QpqtColumnType::INT32;
+            else if (t == "int64")   col.type = QpqtColumnType::INT64;
+            else if (t == "float32") col.type = QpqtColumnType::FLOAT32;
+            else if (t == "float64") col.type = QpqtColumnType::FLOAT64;
+            else if (t == "date32")  col.type = QpqtColumnType::DATE32;
+            else                     col.type = QpqtColumnType::STRING;
+
             col.max_value_bytes = col.is_pqc_encrypted ? 256 : 0;
             schema_.columns.push_back(col);
         }
@@ -147,20 +153,46 @@ public:
             auto& pyval = columns.at(col.name);
 
             if (col.is_pqc_encrypted) {
-                auto lst = pyval.cast<std::vector<std::string>>();
-                pqc.push_back(lst);
+                py::list lst = pyval.cast<py::list>();
+                std::vector<std::string> vals;
+                for (auto item : lst) vals.push_back(item.cast<std::string>());
+                pqc.push_back(vals);
             } else {
-                if (col.type == QpqtColumnType::INT32) {
-                    auto lst = pyval.cast<std::vector<int32_t>>();
-                    structural.push_back(pack_int32_column(lst));
-                } else {
-                    auto lst = pyval.cast<std::vector<std::string>>();
-                    std::vector<uint8_t> buf(num_rows * 256, 0);
-                    for (size_t r = 0; r < lst.size(); ++r) {
-                        size_t clen = std::min(lst[r].size(), (size_t)255);
-                        memcpy(buf.data() + r*256, lst[r].data(), clen);
+                py::list lst = pyval.cast<py::list>();
+                switch (col.type) {
+                    case QpqtColumnType::INT32:
+                    case QpqtColumnType::DATE32: {
+                        std::vector<int32_t> vals;
+                        for (auto item : lst) vals.push_back(item.cast<int32_t>());
+                        structural.push_back(col.type == QpqtColumnType::INT32
+                            ? pack_int32_column(vals) : pack_date32_column(vals));
+                        break;
                     }
-                    structural.push_back(buf);
+                    case QpqtColumnType::INT64: {
+                        std::vector<int64_t> vals;
+                        for (auto item : lst) vals.push_back(item.cast<int64_t>());
+                        structural.push_back(pack_int64_column(vals));
+                        break;
+                    }
+                    case QpqtColumnType::FLOAT32: {
+                        std::vector<float> vals;
+                        for (auto item : lst) vals.push_back(item.cast<float>());
+                        structural.push_back(pack_float32_column(vals));
+                        break;
+                    }
+                    case QpqtColumnType::FLOAT64: {
+                        std::vector<double> vals;
+                        for (auto item : lst) vals.push_back(item.cast<double>());
+                        structural.push_back(pack_float64_column(vals));
+                        break;
+                    }
+                    case QpqtColumnType::STRING:
+                    default: {
+                        std::vector<std::string> vals;
+                        for (auto item : lst) vals.push_back(item.cast<std::string>());
+                        structural.push_back(pack_string_column(vals));
+                        break;
+                    }
                 }
             }
         }
@@ -266,15 +298,39 @@ public:
         for (auto& n : col_names) lists[n] = py::list();
 
         for (auto& row : results) {
-            size_t int32_pos = 0, pqc_pos = 0;
+            size_t struct_pos = 0, pqc_pos = 0;
             for (size_t ci = 0; ci < col_names.size(); ++ci) {
                 if (!col_is_pqc[ci]) {
-                    if (col_types[ci] == QpqtColumnType::INT32) {
-                        int32_t v = int32_pos < row.int32_values.size()
-                                  ? row.int32_values[int32_pos] : 0;
-                        lists[col_names[ci]].append(v);
-                        ++int32_pos;
+                    if (struct_pos < row.structural_values.size()) {
+                        auto& cv = row.structural_values[struct_pos];
+                        if (cv.is_null) {
+                            lists[col_names[ci]].append(py::none());
+                        } else {
+                            switch (col_types[ci]) {
+                                case QpqtColumnType::INT32:
+                                case QpqtColumnType::DATE32:
+                                    lists[col_names[ci]].append(
+                                        std::get<int32_t>(cv.value)); break;
+                                case QpqtColumnType::INT64:
+                                    lists[col_names[ci]].append(
+                                        std::get<int64_t>(cv.value)); break;
+                                case QpqtColumnType::FLOAT32:
+                                    lists[col_names[ci]].append(
+                                        std::get<float>(cv.value)); break;
+                                case QpqtColumnType::FLOAT64:
+                                    lists[col_names[ci]].append(
+                                        std::get<double>(cv.value)); break;
+                                case QpqtColumnType::STRING:
+                                    lists[col_names[ci]].append(
+                                        std::get<std::string>(cv.value)); break;
+                                default:
+                                    lists[col_names[ci]].append(py::none());
+                            }
+                        }
+                    } else {
+                        lists[col_names[ci]].append(py::none());
                     }
+                    ++struct_pos;
                 } else {
                     std::string v = pqc_pos < row.pqc_values.size()
                                   ? row.pqc_values[pqc_pos] : "";
@@ -343,7 +399,9 @@ Create a QPQT writer.
 Args:
     path: Output file path (.qpqt)
     column_names: List of column names
-    column_types: List of types ("int32" or "string") per column
+    column_types: List of types per column.
+                  Structural: "int32", "int64", "float32", "float64", "date32", "string"
+                  PQC (encrypted): always "string"
     pqc_columns: Column names to encrypt with ML-KEM-768 + AES-256-GCM
     public_key: ML-KEM-768 public key bytes (from keygen())
     key_id: 16-byte key ID (from generate_key_id())

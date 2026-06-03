@@ -589,6 +589,188 @@ void test_key_persistence() {
 }
 
 // ─────────────────────────────────────────────────────────
+// TC-TYPES: All column types + mixed schema
+// ─────────────────────────────────────────────────────────
+
+void test_all_types() {
+    current_group = "All Types";
+
+    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN];
+    kem_keygen(pk, sk);
+    uint8_t kid[16] = {};
+
+    // TC-TYPES-01: INT64 structural column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"ts", QpqtColumnType::INT64, false, 8}};
+        std::vector<int64_t> vals = {INT64_MAX, 0LL, -1LL, 1234567890123LL};
+        QpqtWriter w("/tmp/tt01.qpqt", s, kid);
+        w.write_row_group(4, {pack_int64_column(vals)}, {});
+        w.finalize();
+        QpqtReader r("/tmp/tt01.qpqt");
+        ASSERT(r.total_rows() == 4, "TC-TYPES-01: total_rows == 4");
+        auto row = r.read_row(0);
+        ASSERT(!row.structural_values.empty(), "TC-TYPES-01: structural_values populated");
+        ASSERT(std::get<int64_t>(row.structural_values[0].value) == INT64_MAX,
+               "TC-TYPES-01: INT64_MAX roundtrip");
+        auto row3 = r.read_row(3);
+        ASSERT(std::get<int64_t>(row3.structural_values[0].value) == 1234567890123LL,
+               "TC-TYPES-01: large INT64 roundtrip");
+    }
+
+    // TC-TYPES-02: FLOAT32 structural column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"score", QpqtColumnType::FLOAT32, false, 4}};
+        std::vector<float> vals = {3.14f, -1.5f, 0.0f, 1e10f};
+        QpqtWriter w("/tmp/tt02.qpqt", s, kid);
+        w.write_row_group(4, {pack_float32_column(vals)}, {});
+        w.finalize();
+        QpqtReader r("/tmp/tt02.qpqt");
+        auto row = r.read_row(0);
+        float got = std::get<float>(row.structural_values[0].value);
+        ASSERT(std::abs(got - 3.14f) < 0.001f, "TC-TYPES-02: FLOAT32 3.14 roundtrip");
+        auto row1 = r.read_row(1);
+        float got1 = std::get<float>(row1.structural_values[0].value);
+        ASSERT(std::abs(got1 - (-1.5f)) < 0.001f, "TC-TYPES-02: FLOAT32 negative roundtrip");
+    }
+
+    // TC-TYPES-03: FLOAT64 structural column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"lat", QpqtColumnType::FLOAT64, false, 8}};
+        std::vector<double> vals = {51.5074, -0.1278, 40.7128, -74.0060};
+        QpqtWriter w("/tmp/tt03.qpqt", s, kid);
+        w.write_row_group(4, {pack_float64_column(vals)}, {});
+        w.finalize();
+        QpqtReader r("/tmp/tt03.qpqt");
+        auto row = r.read_row(0);
+        double got = std::get<double>(row.structural_values[0].value);
+        ASSERT(std::abs(got - 51.5074) < 1e-6, "TC-TYPES-03: FLOAT64 roundtrip London lat");
+    }
+
+    // TC-TYPES-04: Structural STRING column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"city", QpqtColumnType::STRING, false, 0}};
+        std::vector<std::string> vals = {"London", "New York", "Tokyo", ""};
+        QpqtWriter w("/tmp/tt04.qpqt", s, kid);
+        w.write_row_group(4, {pack_string_column(vals)}, {});
+        w.finalize();
+        QpqtReader r("/tmp/tt04.qpqt");
+        ASSERT(r.total_rows() == 4, "TC-TYPES-04: total_rows == 4");
+        auto row0 = r.read_row(0);
+        ASSERT(std::get<std::string>(row0.structural_values[0].value) == "London",
+               "TC-TYPES-04: structural STRING 'London' roundtrip");
+        auto row2 = r.read_row(2);
+        ASSERT(std::get<std::string>(row2.structural_values[0].value) == "Tokyo",
+               "TC-TYPES-04: structural STRING 'Tokyo' roundtrip");
+        auto row3 = r.read_row(3);
+        ASSERT(std::get<std::string>(row3.structural_values[0].value).empty(),
+               "TC-TYPES-04: empty structural STRING roundtrip");
+    }
+
+    // TC-TYPES-05: DATE32 column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"dob", QpqtColumnType::DATE32, false, 4}};
+        // Days since epoch: 2000-01-01 = 10957, 1990-06-15 = 7470
+        std::vector<int32_t> vals = {10957, 7470, 0, -365};
+        QpqtWriter w("/tmp/tt05.qpqt", s, kid);
+        w.write_row_group(4, {pack_date32_column(vals)}, {});
+        w.finalize();
+        QpqtReader r("/tmp/tt05.qpqt");
+        auto row = r.read_row(0);
+        ASSERT(std::get<int32_t>(row.structural_values[0].value) == 10957,
+               "TC-TYPES-05: DATE32 roundtrip 2000-01-01");
+    }
+
+    // TC-TYPES-06: Mixed schema — INT32 + INT64 + FLOAT64 + STRING(struct) + STRING(pqc)
+    {
+        QpqtSchema s;
+        s.column_count = 5;
+        s.columns = {
+            {"id",      QpqtColumnType::INT32,  false, 4},
+            {"amount",  QpqtColumnType::INT64,  false, 8},
+            {"score",   QpqtColumnType::FLOAT64, false, 8},
+            {"city",    QpqtColumnType::STRING,  false, 0},
+            {"ssn",     QpqtColumnType::STRING,  true,  16},
+        };
+        std::vector<int32_t>     ids    = {1, 2, 3};
+        std::vector<int64_t>     amts   = {100000LL, 200000LL, 300000LL};
+        std::vector<double>      scores = {9.5, 7.2, 8.8};
+        std::vector<std::string> cities = {"NYC", "LON", "TYO"};
+        std::vector<std::string> ssns   = {"SSN-A", "SSN-B", "SSN-C"};
+
+        QpqtWriter w("/tmp/tt06.qpqt", s, kid, pk);
+        w.write_row_group(3,
+            {pack_int32_column(ids),
+             pack_int64_column(amts),
+             pack_float64_column(scores),
+             pack_string_column(cities)},
+            {ssns});
+        w.finalize();
+
+        QpqtReader r("/tmp/tt06.qpqt");
+        r.set_secret_key(sk);
+        ASSERT(r.total_rows() == 3, "TC-TYPES-06: total_rows == 3");
+
+        auto row1 = r.read_row(0);
+        ASSERT(row1.int32_values[0] == 1,              "TC-TYPES-06: row0 INT32 id");
+        ASSERT(std::get<int64_t>(row1.structural_values[1].value) == 100000LL,
+               "TC-TYPES-06: row0 INT64 amount");
+        ASSERT(std::abs(std::get<double>(row1.structural_values[2].value) - 9.5) < 1e-9,
+               "TC-TYPES-06: row0 FLOAT64 score");
+        ASSERT(std::get<std::string>(row1.structural_values[3].value) == "NYC",
+               "TC-TYPES-06: row0 STRING city");
+        ASSERT(row1.pqc_values[0] == "SSN-A",          "TC-TYPES-06: row0 PQC SSN-A");
+
+        auto row2 = r.read_row(2);
+        ASSERT(std::get<std::string>(row2.structural_values[3].value) == "TYO",
+               "TC-TYPES-06: row2 STRING city TYO");
+        ASSERT(row2.pqc_values[0] == "SSN-C",          "TC-TYPES-06: row2 PQC SSN-C");
+    }
+
+    // TC-TYPES-07: Predicate on INT64 column in mixed schema
+    {
+        QpqtSchema s;
+        s.column_count = 3;
+        s.columns = {
+            {"id",     QpqtColumnType::INT32,  false, 4},
+            {"amount", QpqtColumnType::INT64,  false, 8},
+            {"ssn",    QpqtColumnType::STRING,  true,  16},
+        };
+        std::vector<int32_t> ids(1000);
+        std::vector<int64_t> amts(1000);
+        std::vector<std::string> ssns(1000);
+        for (int i = 0; i < 1000; ++i) {
+            ids[i] = i;
+            amts[i] = (int64_t)i * 1000;
+            ssns[i] = "SSN-" + std::to_string(i);
+        }
+        QpqtWriter w("/tmp/tt07.qpqt", s, kid, pk);
+        w.write_row_group(1000,
+            {pack_int32_column(ids), pack_int64_column(amts)}, {ssns});
+        w.finalize();
+
+        QpqtReader r("/tmp/tt07.qpqt");
+        r.set_secret_key(sk);
+        uint64_t s2 = 0;
+        // Filter: amount > 900000 → ids 901..999 = 99 survivors
+        // INT64 values cast to int32_t in predicate (valid since all < INT32_MAX)
+        auto results = r.query(
+            {{1, [](int32_t v){ return v > 900000; }}}, s2);
+        ASSERT(results.size() == 99, "TC-TYPES-07: INT64 predicate 99 survivors");
+        ASSERT(s2 > 0, "TC-TYPES-07: Section 2 read for survivors");
+    }
+}
+
+// ─────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────
 
@@ -621,6 +803,9 @@ int main() {
 
     std::cout << "\n── Key Persistence Tests ──\n";
     RUN(test_key_persistence);
+
+    std::cout << "\n── All Column Types Tests ──\n";
+    RUN(test_all_types);
 
     std::cout << "\n════════════════════════════════\n";
     std::cout << "Tests passed : " << tests_passed << "\n";

@@ -37,7 +37,7 @@ public:
             has_public_key_ = true;
         }
 
-        // Open file for read/write (we need to backfill offsets)
+        // Open for read/write — footer offsets are backfilled during finalize()
         file_.open(path, std::ios::out | std::ios::binary | std::ios::trunc);
         if (!file_) throw std::runtime_error("Cannot open file: " + path);
 
@@ -48,8 +48,6 @@ public:
         write_schema_block();
         write_key_reference_block();
 
-        std::cout << "[writer] Header written. Schema offset: "
-                  << schema_offset_ << "\n";
     }
 
     // Write one row group worth of data
@@ -87,7 +85,7 @@ public:
             const auto& buf = structural_cols[col_idx - schema_.pqc_count()
                                               + (int)(i - col_idx)];
             // Simpler indexing: structural_cols indexed by structural position
-            // We use a helper below
+            // pack helpers defined below encode each type into a flat byte buffer
             (void)buf;
         }
 
@@ -229,11 +227,6 @@ public:
         total_rows_ += row_count;
         ++rg_count_;
 
-        std::cout << "[writer] Row group " << (rg_count_-1)
-                  << " written. rows=" << row_count
-                  << " s1_offset=" << rg_hdr.section1_offset
-                  << " s2_offset=" << section2_start
-                  << " padding=" << pad << "\n";
     }
 
     // Finalize: write footer, backfill header offsets
@@ -291,10 +284,6 @@ public:
 
         file_.close();
 
-        std::cout << "[writer] Finalized. total_rows=" << total_rows_
-                  << " rg_count=" << rg_count_
-                  << " footer_offset=" << footer_start
-                  << " manifest_entries=" << entry_count << "\n";
     }
 
 private:
@@ -355,6 +344,46 @@ std::vector<uint8_t> pack_int32_column(const std::vector<int32_t>& vals) {
     return buf;
 }
 #endif
+
+// ── Additional pack helpers (all structural column types) ─────────────────────
+
+inline std::vector<uint8_t> pack_int64_column(const std::vector<int64_t>& vals) {
+    std::vector<uint8_t> buf(vals.size() * 8);
+    memcpy(buf.data(), vals.data(), buf.size());
+    return buf;
+}
+
+inline std::vector<uint8_t> pack_float32_column(const std::vector<float>& vals) {
+    std::vector<uint8_t> buf(vals.size() * 4);
+    memcpy(buf.data(), vals.data(), buf.size());
+    return buf;
+}
+
+inline std::vector<uint8_t> pack_float64_column(const std::vector<double>& vals) {
+    std::vector<uint8_t> buf(vals.size() * 8);
+    memcpy(buf.data(), vals.data(), buf.size());
+    return buf;
+}
+
+// Structural STRING: length-prefix encoded (uint32_t len + utf8 bytes per value)
+inline std::vector<uint8_t> pack_string_column(const std::vector<std::string>& vals) {
+    std::vector<uint8_t> buf;
+    for (auto& s : vals) {
+        uint32_t len = (uint32_t)s.size();
+        buf.resize(buf.size() + 4 + len);
+        uint8_t* p = buf.data() + buf.size() - 4 - len;
+        memcpy(p, &len, 4);
+        memcpy(p + 4, s.data(), len);
+    }
+    return buf;
+}
+
+// DATE32: days since Unix epoch, same storage as INT32
+inline std::vector<uint8_t> pack_date32_column(const std::vector<int32_t>& vals) {
+    std::vector<uint8_t> buf(vals.size() * 4);
+    memcpy(buf.data(), vals.data(), buf.size());
+    return buf;
+}
 
 // ─────────────────────────────────────────────────────────
 // main — Week 1 smoke test

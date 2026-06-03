@@ -94,16 +94,10 @@ inline void kem_decapsulate(
 // Per spec section 8.2
 // ─────────────────────────────────────────────────────────
 
-// HKDF-SHA256 implemented via HMAC primitives (OpenSSL 1.1.1+ compatible).
-//
-// Note on hash choice: the original spec named HKDF-SHA3-256, but SHA3-256
-// is not available in the HMAC API on all OpenSSL 1.1.1 builds in manylinux
-// containers. We use HKDF-SHA-256 (standard SHA-2) instead. The security
-// level is identical for this application: both produce 256 bits of output
-// from the ML-KEM shared secret, and the KDF is used solely for domain
-// separation between page keys, not for any purpose where the hash family
-// matters cryptographically. The format spec will be updated to reflect
-// HKDF-SHA-256 in v1.1.
+// HKDF-SHA-256 via HMAC primitives (OpenSSL 1.1.1+ compatible).
+// SHA-2 is used in place of SHA3-256 for portability across manylinux
+// OpenSSL builds. Security level is identical: 256-bit output from the
+// ML-KEM shared secret for domain-separated page key derivation.
 //
 // HKDF construction (RFC 5869):
 //   Extract: PRK = HMAC-SHA256(salt=zeros, IKM)
@@ -125,7 +119,7 @@ inline void hkdf_sha3_256(
         throw std::runtime_error("HKDF extract failed");
 
     // HKDF-Expand: T(1) = HMAC-SHA256(PRK, info || 0x01)
-    // We need exactly 32 bytes so one round is sufficient.
+    // One HKDF-Expand round produces exactly 32 bytes.
     std::vector<uint8_t> expand_input(info, info + info_len);
     expand_input.push_back(0x01);
 

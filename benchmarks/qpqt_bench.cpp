@@ -1,137 +1,136 @@
 /**
- * qpqt_bench.cpp
- * Performance benchmark — mirrors published results.
- *
- * Produces:
- *   - Write throughput at 1M rows
- *   - Structural column scan speed
- *   - Selectivity sweep (1% to 100%)
- *
- * Compile:
- *   g++ -O3 -std=c++17 -fopenmp \
- *       -I../include -I/usr/local/include \
- *       qpqt_bench.cpp -o qpqt_bench \
- *       -L/usr/local/lib -loqs -lssl -lcrypto \
- *       -Wl,-rpath,/usr/local/lib
+ * qpqt_bench.cpp - Stress test + selectivity benchmark.
+ * Tests all column types + lazy decryption USP.
  */
-
 #include <iostream>
 #include <iomanip>
 #include <fstream>
+#include <chrono>
 #include <vector>
 #include <string>
-#include <chrono>
 #include <cstring>
-#include "qpqt_types.h"
-#include "qpqt_utils.h"
-#include "qpqt_crypto.h"
-
+#include <cmath>
+#include "../include/qpqt_types.h"
+#include "../include/qpqt_utils.h"
+#include "../include/qpqt_crypto.h"
 #define QPQT_PACK_INT32_DEFINED
 #define QPQT_WRITER_NO_MAIN
 #include "../src/qpqt_writer.cpp"
-
 #define QPQT_READER_NO_MAIN
 #undef ASSERT
 #include "../src/qpqt_reader.cpp"
-
 using namespace qpqt;
 using namespace qpqt::crypto;
-
+using Clock = std::chrono::high_resolution_clock;
 static std::vector<uint8_t> pack_int32_column(const std::vector<int32_t>& v) {
-    std::vector<uint8_t> b(v.size()*4);
-    memcpy(b.data(), v.data(), b.size());
-    return b;
+    std::vector<uint8_t> b(v.size()*4); memcpy(b.data(),v.data(),b.size()); return b;
 }
-
-double now_ms() {
-    return std::chrono::duration<double,std::milli>(
-        std::chrono::high_resolution_clock::now().time_since_epoch()
-    ).count();
+static double elapsed_s(std::chrono::time_point<Clock> t0, std::chrono::time_point<Clock> t1) {
+    return std::chrono::duration<double>(t1-t0).count();
 }
-
 int main() {
-    std::cout << "=== QPQT Performance Benchmark ===\n";
-    std::cout << "1M rows | ML-KEM-768 + AES-256-GCM\n\n";
-
-    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN];
-    kem_keygen(pk, sk);
-    uint8_t key_id[16] = {};
+    const uint32_t TOTAL = 1000000;
+    const char* FILE = "/tmp/qpqt_bench.qpqt";
+    static const char* REGIONS[] = {"APAC","EMEA","NA","LATAM"};
 
     QpqtSchema schema;
-    schema.column_count = 2;
+    schema.column_count = 6;
     schema.columns = {
-        {"id",  QpqtColumnType::INT32,  false, 4},
-        {"pii", QpqtColumnType::STRING,  true, 64}
+        {"customer_id",  QpqtColumnType::INT32,   false, 4},
+        {"amount_cents", QpqtColumnType::INT64,   false, 8},
+        {"score",        QpqtColumnType::FLOAT64, false, 8},
+        {"region",       QpqtColumnType::STRING,  false, 0},
+        {"ssn",          QpqtColumnType::STRING,  true,  16},
+        {"dob",          QpqtColumnType::DATE32,  false, 4},
     };
 
-    // ── Write benchmark ──
-    std::cout << "Writing 1M rows...\n";
-    double t0 = now_ms();
+    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN], kid[16] = {};
+    kem_keygen(pk, sk);
+
+    std::cout << "\n============================================================\n";
+    std::cout << "  QPQT Stress Test + Selectivity Benchmark\n";
+    std::cout << "  Schema: INT32 + INT64 + FLOAT64 + STRING + PQC + DATE32\n";
+    std::cout << "  Rows: " << TOTAL << "\n";
+    std::cout << "============================================================\n\n";
+
+    // Write
+    std::cerr << "Writing " << TOTAL << " rows...\n";
+    auto t0 = Clock::now();
     {
-        QpqtWriter w("/tmp/bench_1m.qpqt", schema, key_id, pk);
-        for (int rg=0; rg<10; ++rg) {
-            std::vector<int32_t> ids(100000);
-            std::vector<std::string> piis(100000);
-            for (int i=0;i<100000;++i){
-                int abs=rg*100000+i;
-                ids[i]=abs; piis[i]="PII-"+std::to_string(abs);
+        QpqtWriter w(FILE, schema, kid, pk);
+        const uint32_t RG = QPQT_ROWS_PER_ROW_GROUP;
+        for (uint32_t base = 0; base < TOTAL; base += RG) {
+            uint32_t n = std::min(RG, TOTAL - base);
+            std::vector<int32_t>     ids(n);
+            std::vector<int64_t>     amts(n);
+            std::vector<double>      scores(n);
+            std::vector<std::string> regions(n), ssns(n);
+            std::vector<int32_t>     dobs(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                uint32_t a = base+i;
+                ids[i]=(int32_t)a; amts[i]=(int64_t)a*100;
+                scores[i]=100.0*std::sin(a*0.001);
+                regions[i]=REGIONS[a%4]; ssns[i]="SSN"+std::to_string(a);
+                dobs[i]=10957+(int32_t)(a%36500);
             }
-            w.write_row_group(100000,{pack_int32_column(ids)},{piis});
+            w.write_row_group(n, {pack_int32_column(ids), pack_int64_column(amts),
+                pack_float64_column(scores), pack_string_column(regions),
+                pack_date32_column(dobs)}, {ssns});
         }
         w.finalize();
     }
-    double t_write = now_ms() - t0;
-    std::ifstream fs("/tmp/bench_1m.qpqt", std::ios::ate|std::ios::binary);
-    uint64_t fsize_mb = fs.tellg() / (1024*1024);
-    std::cout << std::fixed << std::setprecision(1);
-    std::cout << "  Write time  : " << t_write << "ms\n";
-    std::cout << "  Throughput  : " << std::setprecision(0)
-              << (1000000.0/t_write)*1000 << " rows/sec\n";
-    std::cout << "  File size   : " << fsize_mb << " MB\n\n";
+    double ws = elapsed_s(t0, Clock::now());
+    double mb; { std::ifstream f(FILE,std::ios::ate|std::ios::binary); mb=f.tellg()/1e6; }
+    std::cerr << "Done: " << std::fixed << std::setprecision(1) << ws << "s  " << mb << " MB\n\n";
 
-    // ── Structural scan ──
+    // Type spot-check
     {
-        QpqtReader r("/tmp/bench_1m.qpqt");
-        r.set_secret_key(sk);
-        double t = now_ms();
-        uint64_t s2=0;
-        auto res = r.query({{0,[](int32_t v){return v>2000000;}}}, s2);
-        double ms = now_ms()-t;
-        std::cout << "Structural scan (no crypto): " << ms << "ms  "
-                  << std::setprecision(0) << (1000000.0/ms)*1000
-                  << " rows/sec  s2_bytes=" << s2 << "\n\n";
+        QpqtReader r(FILE); r.set_secret_key(sk);
+        auto row = r.read_row(42);
+        bool ok = (row.int32_values[0] == 42)
+               && (std::get<int64_t>(row.structural_values[1].value) == 4200LL)
+               && (std::get<std::string>(row.structural_values[3].value) == "NA")
+               && (row.pqc_values[0] == "SSN42");
+        std::cout << "  Type check row 42: " << (ok ? "PASS" : "FAIL") << "\n\n";
+        if (!ok) return 1;
     }
 
-    // ── Selectivity sweep ──
-    std::cout << std::left
-              << std::setw(14) << "Selectivity"
-              << std::setw(14) << "Survivors"
-              << std::setw(14) << "Query(ms)"
-              << std::setw(16) << "Rows/sec"
-              << std::setw(16) << "Speedup vs naive"
-              << "\n";
-    std::cout << std::string(74, '-') << "\n";
+    // Selectivity sweep
+    struct R { const char* label; uint64_t hits; double s2pct, time_s; };
+    std::vector<R> res;
+    auto run = [&](const char* lbl, std::vector<QpqtPredicate> preds, uint64_t exp) {
+        QpqtReader r(FILE); r.set_secret_key(sk);
+        uint64_t s2=0; auto t=Clock::now();
+        uint64_t hits=r.query_count(preds,s2);
+        double el=elapsed_s(t,Clock::now());
+        double tot=TOTAL*(16.0+QPQT_AES_GCM_TAG_LEN);
+        double pct=tot>0?s2*100.0/tot:0.0;
+        res.push_back({lbl,hits,pct,el});
+        std::cout << "  " << std::left << std::setw(40) << lbl
+                  << std::setw(10) << hits
+                  << std::setw(8) << (std::to_string((int)std::round(pct))+"%")
+                  << std::setw(10) << (std::to_string((int)(el*1000))+"ms")
+                  << (hits==exp?"PASS":"FAIL") << "\n";
+    };
 
-    double naive_ms = 9600.0;
-    for (int sel : {1,5,10,25,50,100}) {
-        QpqtReader r("/tmp/bench_1m.qpqt");
-        r.set_secret_key(sk);
-        int div = 100/sel;
-        double t = now_ms();
-        uint64_t s2=0;
-        auto res = r.query({{0,[div](int32_t v){return v%div==0;}}}, s2);
-        double ms = now_ms()-t;
-        std::cout << std::left
-                  << std::setw(14) << (std::to_string(sel)+"%")
-                  << std::setw(14) << res.size()
-                  << std::setw(14) << std::setprecision(1) << ms
-                  << std::setw(16) << std::setprecision(0)
-                  << (res.size()>0?(res.size()/ms)*1000:0)
-                  << std::setw(16) << std::setprecision(1) << naive_ms/ms
-                  << "\n";
+    std::cout << "  " << std::left << std::setw(40) << "Query"
+              << std::setw(10) << "Survivors" << std::setw(8) << "S2 read"
+              << std::setw(10) << "Time" << "Result\n";
+    std::cout << "  " << std::string(70,'-') << "\n";
+    run("0%  impossible (id > 2000000)",  {{0,[](int32_t v){return v>2000000;}}}, 0);
+    run("1%  id % 100 == 0",             {{0,[](int32_t v){return v%100==0;}}}, TOTAL/100);
+    run("10% id % 10 == 0",              {{0,[](int32_t v){return v%10==0;}}},  TOTAL/10);
+    run("50% id % 2 == 0",               {{0,[](int32_t v){return v%2==0;}}},   TOTAL/2);
+    run("100% no filter",                {},                                     TOTAL);
+
+    std::cout << "\n============================================================\n";
+    std::cout << "  USP Proof:\n";
+    if (res.size()>=2) {
+        std::cout << "  0%  selectivity -> S2 read = " << res[0].s2pct << "% (zero PQC decryptions)\n";
+        std::cout << "  1%  selectivity -> S2 read = " << std::setprecision(1) << res[1].s2pct << "%\n";
+        double speedup = res.back().time_s / std::max(res[0].time_s, 0.001);
+        std::cout << "  Speedup (100% vs 0%): " << std::setprecision(0) << speedup << "x\n";
     }
-
-    std::cout << "\nNaive PQC baseline (row-level ML-KEM, 4-core): "
-              << naive_ms << "ms\n";
+    std::cout << "============================================================\n\n";
     return 0;
 }
