@@ -113,6 +113,9 @@ inline std::vector<uint8_t> serialize_schema(const QpqtSchema& schema) {
         buf.push_back((mvb >>  8) & 0xFF);
         buf.push_back((mvb >> 16) & 0xFF);
         buf.push_back((mvb >> 24) & 0xFF);
+
+        // nullable flag (absent in format version 1.0, defaults to false)
+        buf.push_back(col.nullable ? 1 : 0);
     }
     return buf;
 }
@@ -146,6 +149,10 @@ inline QpqtSchema deserialize_schema(const uint8_t* data, size_t len) {
                             | (data[pos+2] << 16)
                             | (data[pos+3] << 24);
         pos += 4;
+
+        // nullable flag — absent in format version 1.0 files, defaults to false
+        col.nullable = false;
+        if (pos < len) col.nullable = (data[pos++] != 0);
 
         schema.columns.push_back(col);
     }

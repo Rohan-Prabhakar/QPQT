@@ -442,7 +442,7 @@ void test_edge_cases() {
             w.finalize();
         }
         // Truncate to 100 bytes (destroys footer)
-        truncate("/tmp/t21.qpqt", 100);
+        { int r = truncate("/tmp/t21.qpqt", 100); (void)r; }
         bool caught=false;
         try {
             QpqtReader r("/tmp/t21.qpqt");
@@ -771,6 +771,237 @@ void test_all_types() {
 }
 
 // ─────────────────────────────────────────────────────────
+// TC-NULL: Validity bitmaps
+// ─────────────────────────────────────────────────────────
+
+void test_nulls() {
+    current_group = "NULL Handling";
+
+    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN];
+    kem_keygen(pk, sk);
+    uint8_t kid[16] = {};
+
+    // TC-NULL-01: 50% nulls in INT32 column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"score", QpqtColumnType::INT32, false, 4}};
+        s.columns[0].nullable = true;
+
+        std::vector<int32_t> vals   = {10, 0, 30, 0, 50};  // 0 = placeholder for null
+        std::vector<bool>    mask   = {true, false, true, false, true}; // true=non-null
+
+        QpqtWriter w("/tmp/tn01.qpqt", s, kid);
+        w.write_row_group(5, {pack_int32_column(vals)}, {}, {mask});
+        w.finalize();
+
+        QpqtReader r("/tmp/tn01.qpqt");
+        auto row0 = r.read_row(0);
+        auto row1 = r.read_row(1);
+        auto row2 = r.read_row(2);
+
+        ASSERT(!row0.structural_values[0].is_null, "TC-NULL-01: row 0 is non-null");
+        ASSERT(std::get<int32_t>(row0.structural_values[0].value) == 10,
+               "TC-NULL-01: row 0 value == 10");
+        ASSERT(row1.structural_values[0].is_null, "TC-NULL-01: row 1 is null");
+        ASSERT(!row2.structural_values[0].is_null, "TC-NULL-01: row 2 is non-null");
+        ASSERT(std::get<int32_t>(row2.structural_values[0].value) == 30,
+               "TC-NULL-01: row 2 value == 30");
+    }
+
+    // TC-NULL-02: NULL rows do not match predicates
+    {
+        QpqtSchema s;
+        s.column_count = 2;
+        s.columns = {
+            {"id",  QpqtColumnType::INT32, false, 4},
+            {"ssn", QpqtColumnType::STRING, true, 16},
+        };
+        s.columns[0].nullable = true;
+
+        // 10 rows: even rows have null id, odd rows have id = row_index
+        std::vector<int32_t>     ids(10);
+        std::vector<bool>        mask(10);
+        std::vector<std::string> ssns(10);
+        for (int i = 0; i < 10; ++i) {
+            ids[i]  = i;
+            mask[i] = (i % 2 != 0); // odd rows non-null
+            ssns[i] = "SSN-" + std::to_string(i);
+        }
+
+        QpqtWriter w("/tmp/tn02.qpqt", s, kid, pk);
+        w.write_row_group(10, {pack_int32_column(ids)}, {ssns}, {mask});
+        w.finalize();
+
+        QpqtReader r("/tmp/tn02.qpqt");
+        r.set_secret_key(sk);
+        uint64_t s2 = 0;
+        // Filter id > 0: should only match non-null rows with id > 0
+        // Non-null rows: 1,3,5,7,9 — id > 0: 1,3,5,7,9 = 5 survivors
+        auto results = r.query({{0, [](int32_t v){ return v > 0; }}}, s2);
+        ASSERT(results.size() == 5, "TC-NULL-02: 5 non-null survivors with id > 0");
+        ASSERT(s2 > 0, "TC-NULL-02: Section 2 read for survivors");
+    }
+
+    // TC-NULL-03: All-null column
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"val", QpqtColumnType::INT32, false, 4}};
+        s.columns[0].nullable = true;
+
+        std::vector<int32_t> vals = {1, 2, 3};
+        std::vector<bool>    mask = {false, false, false}; // all null
+
+        QpqtWriter w("/tmp/tn03.qpqt", s, kid);
+        w.write_row_group(3, {pack_int32_column(vals)}, {}, {mask});
+        w.finalize();
+
+        QpqtReader r("/tmp/tn03.qpqt");
+        uint64_t s2 = 0;
+        auto results = r.query({{0, [](int32_t v){ return v > 0; }}}, s2);
+        ASSERT(results.empty(), "TC-NULL-03: all-null column → 0 survivors");
+        ASSERT(s2 == 0, "TC-NULL-03: no Section 2 read for all-null");
+    }
+
+    // TC-NULL-04: Non-nullable column reads unchanged (v1.0 compatible)
+    {
+        QpqtSchema s;
+        s.column_count = 1;
+        s.columns = {{"id", QpqtColumnType::INT32, false, 4}};
+        // nullable = false (default) — no bitmap written
+
+        std::vector<int32_t> vals = {100, 200, 300};
+        QpqtWriter w("/tmp/tn04.qpqt", s, kid);
+        w.write_row_group(3, {pack_int32_column(vals)}, {});
+        w.finalize();
+
+        QpqtReader r("/tmp/tn04.qpqt");
+        auto row = r.read_row(1);
+        ASSERT(!row.structural_values[0].is_null, "TC-NULL-04: non-nullable col not null");
+        ASSERT(std::get<int32_t>(row.structural_values[0].value) == 200,
+               "TC-NULL-04: non-nullable value correct");
+    }
+
+    // TC-NULL-05: Mixed nullable + non-nullable in same schema
+    {
+        QpqtSchema s;
+        s.column_count = 3;
+        s.columns = {
+            {"id",    QpqtColumnType::INT32,  false, 4},
+            {"score", QpqtColumnType::FLOAT64, false, 8},
+            {"ssn",   QpqtColumnType::STRING,  true,  16},
+        };
+        s.columns[0].nullable = false;
+        s.columns[1].nullable = true; // score is nullable
+
+        std::vector<int32_t> ids    = {1, 2, 3, 4};
+        std::vector<double>  scores = {9.5, 0.0, 8.8, 0.0};
+        std::vector<bool>    smask  = {true, false, true, false};
+        std::vector<std::string> ssns = {"A", "B", "C", "D"};
+
+        QpqtWriter w("/tmp/tn05.qpqt", s, kid, pk);
+        // validity_masks: one per structural column in order (id, score)
+        w.write_row_group(4,
+            {pack_int32_column(ids), pack_float64_column(scores)},
+            {ssns},
+            {{}, smask}); // id has no mask, score has mask
+        w.finalize();
+
+        QpqtReader r("/tmp/tn05.qpqt");
+        r.set_secret_key(sk);
+
+        auto row0 = r.read_row(0);
+        auto row1 = r.read_row(1);
+
+        ASSERT(!row0.structural_values[0].is_null, "TC-NULL-05: id[0] non-null");
+        ASSERT(!row0.structural_values[1].is_null, "TC-NULL-05: score[0] non-null");
+        ASSERT(std::abs(std::get<double>(row0.structural_values[1].value) - 9.5) < 1e-9,
+               "TC-NULL-05: score[0] == 9.5");
+
+        ASSERT(!row1.structural_values[0].is_null, "TC-NULL-05: id[1] non-null");
+        ASSERT(row1.structural_values[1].is_null,  "TC-NULL-05: score[1] is null");
+        ASSERT(row1.pqc_values[0] == "B",          "TC-NULL-05: ssn[1] == B");
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// TC-STATS: Row group statistics + skipping
+// ─────────────────────────────────────────────────────────
+
+void test_rg_stats() {
+    current_group = "RG Statistics";
+
+    uint8_t pk[ML_KEM_768_PK_LEN], sk[ML_KEM_768_SK_LEN];
+    kem_keygen(pk, sk);
+    uint8_t kid[16] = {};
+
+    // Write 3 row groups with non-overlapping id ranges:
+    // RG0: ids 0..99     (max=99)
+    // RG1: ids 100..199  (max=199)
+    // RG2: ids 200..299  (max=299)
+    QpqtSchema s;
+    s.column_count = 2;
+    s.columns = {
+        {"id",  QpqtColumnType::INT32,  false, 4},
+        {"ssn", QpqtColumnType::STRING, true,  16},
+    };
+
+    QpqtWriter w("/tmp/ts01.qpqt", s, kid, pk);
+    for (int rg = 0; rg < 3; ++rg) {
+        std::vector<int32_t>     ids(100);
+        std::vector<std::string> ssns(100);
+        for (int i = 0; i < 100; ++i) {
+            ids[i]  = rg * 100 + i;
+            ssns[i] = "SSN-" + std::to_string(rg * 100 + i);
+        }
+        w.write_row_group(100, {pack_int32_column(ids)}, {ssns});
+    }
+    w.finalize();
+
+    // TC-STATS-01: Query that only matches RG2 — RG0 and RG1 skipped by stats
+    {
+        QpqtReader r("/tmp/ts01.qpqt");
+        r.set_secret_key(sk);
+        uint64_t s2 = 0;
+        auto results = r.query({{0, [](int32_t v){ return v >= 200; }}}, s2);
+        ASSERT(results.size() == 100, "TC-STATS-01: 100 survivors from RG2");
+        ASSERT(results[0].int32_values[0] == 200, "TC-STATS-01: first id == 200");
+        ASSERT(s2 > 0, "TC-STATS-01: Section 2 read for RG2");
+    }
+
+    // TC-STATS-02: Query that matches no row group — all skipped
+    {
+        QpqtReader r("/tmp/ts01.qpqt");
+        r.set_secret_key(sk);
+        uint64_t s2 = 0;
+        auto results = r.query({{0, [](int32_t v){ return v > 500; }}}, s2);
+        ASSERT(results.empty(), "TC-STATS-02: 0 survivors — all RGs skipped");
+        ASSERT(s2 == 0, "TC-STATS-02: no Section 2 read");
+    }
+
+    // TC-STATS-03: Query matching only RG1 — RG0 and RG2 skipped
+    {
+        QpqtReader r("/tmp/ts01.qpqt");
+        r.set_secret_key(sk);
+        uint64_t s2 = 0;
+        auto results = r.query(
+            {{0, [](int32_t v){ return v >= 100 && v < 200; }}}, s2);
+        ASSERT(results.size() == 100, "TC-STATS-03: 100 survivors from RG1");
+        ASSERT(results[0].pqc_values[0] == "SSN-100", "TC-STATS-03: first SSN correct");
+    }
+
+    // TC-STATS-04: Query matching all row groups — no skipping
+    {
+        QpqtReader r("/tmp/ts01.qpqt");
+        r.set_secret_key(sk);
+        uint64_t s2 = 0;
+        auto results = r.query({{0, [](int32_t v){ return v >= 0; }}}, s2);
+        ASSERT(results.size() == 300, "TC-STATS-04: 300 survivors — all RGs scanned");
+    }
+}
+
+// ─────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────
 
@@ -806,6 +1037,12 @@ int main() {
 
     std::cout << "\n── All Column Types Tests ──\n";
     RUN(test_all_types);
+
+    std::cout << "\n── NULL Handling Tests ──\n";
+    RUN(test_nulls);
+
+    std::cout << "\n── Row Group Statistics Tests ──\n";
+    RUN(test_rg_stats);
 
     std::cout << "\n════════════════════════════════\n";
     std::cout << "Tests passed : " << tests_passed << "\n";

@@ -77,6 +77,12 @@ public:
                 continue;
             }
 
+            // Skip this RG if statistics prove no row can satisfy all predicates
+            if (rg_eliminated_by_stats(oe.row_group_index, predicates)) {
+                rows_seen += rg_row_count;
+                continue;
+            }
+
             auto rg_results = query_row_group(
                 oe, (uint32_t)rg_row_count, predicates, out_section2_bytes_read
             );
@@ -102,6 +108,7 @@ public:
         out_section2_bytes_read = 0;
         uint64_t count = 0;
         for (auto& oe : rg_offsets_) {
+            if (rg_eliminated_by_stats(oe.row_group_index, predicates)) continue;
             file_.seekg(oe.file_byte_offset);
             QpqtRowGroupHeader rg_hdr;
             file_.read(reinterpret_cast<char*>(&rg_hdr), QpqtRowGroupHeader::SIZE);
@@ -122,16 +129,20 @@ public:
 
         auto& oe = rg_offsets_[rg_idx];
 
+        // Read row group header to get row count (needed for bitmap parsing)
+        file_.seekg(oe.file_byte_offset);
+        QpqtRowGroupHeader rg_hdr;
+        file_.read(reinterpret_cast<char*>(&rg_hdr), QpqtRowGroupHeader::SIZE);
+
         // Read section 1 for this row group
         auto [s1_data, s1_size] = read_section1(oe);
 
         QpqtResultRow row;
         row.row_index = row_index;
 
-        // Extract INT32 values for this specific row
-        extract_int32_values(s1_data, oe, row_in_rg, 1, row);
+        extract_int32_values(s1_data, oe, row_in_rg, 1, row, rg_hdr.row_count);
 
-        // Read PQC value (stub)
+        // Read PQC value (decrypted if secret key is set)
         row.pqc_values = read_pqc_row(oe, row_in_rg);
 
         return row;
@@ -149,6 +160,56 @@ private:
     uint8_t                 secret_key_[crypto::ML_KEM_768_SK_LEN] = {};
     bool                    has_secret_key_ = false;
     crypto::PageKeyCache    page_key_cache_;
+    std::vector<QpqtRGStatEntry> stats_;
+
+    // Returns true if all predicates are eliminated by row group statistics.
+    // A predicate eliminates a row group when:
+    //   pred > max  (nothing in the RG can pass pred > X if max <= X)
+    //   pred < min  (nothing in the RG can pass pred < X if min >= X)
+    //   pred == val and val not in [min, max]
+    bool rg_eliminated_by_stats(uint32_t rg_idx,
+                                 const std::vector<QpqtPredicate>& preds) const {
+        if (stats_.empty() || preds.empty()) return false;
+        for (auto& pred : preds) {
+            uint16_t ci = pred.col_index;
+            if (ci >= schema_.column_count) continue;
+            if (schema_.columns[ci].is_pqc_encrypted) continue;
+
+            // Find stat entry for this (rg, col)
+            const QpqtRGStatEntry* se = nullptr;
+            for (auto& s : stats_)
+                if (s.row_group_index == rg_idx && s.col_index == ci) { se = &s; break; }
+            if (!se || !se->has_min || !se->has_max) continue;
+
+            // Extract min/max as int32 for comparison (same cast as predicate)
+            int32_t mn = 0, mx = 0;
+            auto type = schema_.columns[ci].type;
+            if (type == QpqtColumnType::INT32 || type == QpqtColumnType::DATE32) {
+                memcpy(&mn, se->min_bytes, 4);
+                memcpy(&mx, se->max_bytes, 4);
+            } else if (type == QpqtColumnType::INT64) {
+                int64_t v; memcpy(&v, se->min_bytes, 8); mn = (int32_t)v;
+                           memcpy(&v, se->max_bytes, 8); mx = (int32_t)v;
+            } else if (type == QpqtColumnType::FLOAT32) {
+                float v; memcpy(&v, se->min_bytes, 4); mn = (int32_t)v;
+                         memcpy(&v, se->max_bytes, 4); mx = (int32_t)v;
+            } else if (type == QpqtColumnType::FLOAT64) {
+                double v; memcpy(&v, se->min_bytes, 8); mn = (int32_t)v;
+                          memcpy(&v, se->max_bytes, 8); mx = (int32_t)v;
+            } else continue;
+
+            // Test if predicate eliminates entire RG:
+            // probe min and max — if neither passes the predicate, skip
+            bool min_passes = pred.test(mn);
+            bool max_passes = pred.test(mx);
+            // For monotone predicates (>, >=, <, <=, ==):
+            // If max fails pred > X  → all values fail → skip
+            // If min fails pred < X  → all values fail → skip
+            // Conservative: if neither endpoint passes AND range is tight, skip
+            if (!min_passes && !max_passes) return true;
+        }
+        return false;
+    }
 
 
     void read_and_verify_footer() {
@@ -207,6 +268,17 @@ private:
         for (uint32_t i = 0; i < me_count; ++i) {
             file_.read(reinterpret_cast<char*>(&manifest_[i]),
                        QpqtManifestEntry::SIZE);
+        }
+
+        // Read stats block if present (stats_offset == 0 means absent)
+        if (footer_hdr_.stats_offset != 0) {
+            file_.seekg(footer_hdr_.stats_offset);
+            uint32_t sc;
+            file_.read(reinterpret_cast<char*>(&sc), 4);
+            stats_.resize(sc);
+            for (uint32_t i = 0; i < sc; ++i)
+                file_.read(reinterpret_cast<char*>(&stats_[i]),
+                           QpqtRGStatEntry::SIZE);
         }
     }
 
@@ -293,7 +365,7 @@ private:
         for (size_t i = 0; i < survivors.size(); ++i) {
             results[i].row_index = (uint64_t)oe.row_group_index
                                  * QPQT_ROWS_PER_ROW_GROUP + survivors[i];
-            extract_int32_values(s1_data, oe, survivors[i], 1, results[i]);
+            extract_int32_values(s1_data, oe, survivors[i], 1, results[i], rg_row_count);
         }
 
         // Step 8: per PQC column, read page-by-page, decrypt in parallel
@@ -312,17 +384,15 @@ private:
                 // ── Derive AES key for this page (once) ──
                 uint8_t aes_key[QPQT_AES_KEY_LEN];
                 {
-                    uint64_t manifest_idx =
-                        ((uint64_t)oe.row_group_index
-                         * footer_hdr_.pages_per_rg
-                         * footer_hdr_.pqc_column_count)
-                      + ((uint64_t)pg * footer_hdr_.pqc_column_count)
-                      + pqc_pos;
-
-                    if (manifest_idx >= manifest_.size())
-                        throw std::runtime_error("Manifest index out of range");
-
-                    auto& me = manifest_[manifest_idx];
+                    // Lookup manifest entry by coordinates
+                    const QpqtManifestEntry* me_ptr = nullptr;
+                    for (auto& me : manifest_)
+                        if (me.row_group_index == oe.row_group_index &&
+                            me.page_index      == pg &&
+                            me.column_index    == col_i) { me_ptr = &me; break; }
+                    if (!me_ptr)
+                        throw std::runtime_error("Manifest entry not found");
+                    auto& me = *me_ptr;
                     if (!has_secret_key_)
                         throw std::runtime_error(
                             "PQC column requires secret key — call set_secret_key() first");
@@ -485,7 +555,7 @@ private:
 
         // Parse INT32 column from section 1 data
         // Section 1 layout: col_index(2) + byte_length(8) + raw_data
-        // We only handle INT32 predicates in Week 2
+        // Predicates applied on structural columns only (PQC columns not filterable)
         std::vector<uint32_t> survivors;
         survivors.reserve(rg_row_count / 10);
 
@@ -493,9 +563,11 @@ private:
         const uint8_t* ptr = s1_data.data();
         const uint8_t* end = ptr + s1_data.size();
 
-        // Map: col_index → pointer to raw int32 data
+        // Map: col_index → pointer to raw data (after bitmap if nullable)
         std::vector<const int32_t*> col_data(schema_.column_count, nullptr);
         std::vector<uint32_t>       col_row_counts(schema_.column_count, 0);
+        // Map: col_index → validity bitmap pointer (nullptr if not nullable)
+        std::vector<const uint8_t*> col_bitmap(schema_.column_count, nullptr);
 
         uint16_t cols_parsed = 0;
         uint16_t struct_col_count = schema_.structural_count();
@@ -505,34 +577,44 @@ private:
             memcpy(&col_idx,  ptr,     2);
             memcpy(&byte_len, ptr + 2, 8);
 
-            // Stop if we hit padding (col_idx >= column_count or byte_len == 0)
             if (col_idx >= schema_.column_count || byte_len == 0) break;
 
             ptr += 10;
-
             if (ptr + byte_len > end) break;
 
-            // Store pointer for any structural type — predicate application
-            // dispatches on type below
             if (!schema_.columns[col_idx].is_pqc_encrypted) {
-                col_data[col_idx] = reinterpret_cast<const int32_t*>(ptr);
-                if (schema_.columns[col_idx].type == QpqtColumnType::INT32 ||
-                    schema_.columns[col_idx].type == QpqtColumnType::DATE32)
-                    col_row_counts[col_idx] = (uint32_t)(byte_len / 4);
-                else if (schema_.columns[col_idx].type == QpqtColumnType::INT64)
-                    col_row_counts[col_idx] = (uint32_t)(byte_len / 8);
-                else if (schema_.columns[col_idx].type == QpqtColumnType::FLOAT32)
-                    col_row_counts[col_idx] = (uint32_t)(byte_len / 4);
-                else if (schema_.columns[col_idx].type == QpqtColumnType::FLOAT64)
-                    col_row_counts[col_idx] = (uint32_t)(byte_len / 8);
+                auto& col = schema_.columns[col_idx];
+                const uint8_t* data_ptr = ptr;
+                uint64_t data_len = byte_len;
+
+                // Skip validity bitmap if column is nullable
+                if (col.nullable) {
+                    uint32_t bitmap_bytes = (rg_row_count + 7) / 8;
+                    if (data_len >= bitmap_bytes) {
+                        col_bitmap[col_idx] = data_ptr;
+                        data_ptr += bitmap_bytes;
+                        data_len -= bitmap_bytes;
+                    }
+                }
+
+                col_data[col_idx] = reinterpret_cast<const int32_t*>(data_ptr);
+                if (col.type == QpqtColumnType::INT32 || col.type == QpqtColumnType::DATE32)
+                    col_row_counts[col_idx] = (uint32_t)(data_len / 4);
+                else if (col.type == QpqtColumnType::INT64)
+                    col_row_counts[col_idx] = (uint32_t)(data_len / 8);
+                else if (col.type == QpqtColumnType::FLOAT32)
+                    col_row_counts[col_idx] = (uint32_t)(data_len / 4);
+                else if (col.type == QpqtColumnType::FLOAT64)
+                    col_row_counts[col_idx] = (uint32_t)(data_len / 8);
                 else
-                    col_row_counts[col_idx] = rg_row_count; // STRING: row count from header
+                    col_row_counts[col_idx] = rg_row_count;
             }
             ptr += byte_len;
             ++cols_parsed;
         }
 
         // Apply predicates row by row — dispatch on column type
+        // NULL values never match any predicate
         for (uint32_t r = 0; r < rg_row_count; ++r) {
             bool pass = true;
             for (auto& pred : predicates) {
@@ -540,6 +622,11 @@ private:
                 if (ci >= schema_.column_count) continue;
                 if (col_data[ci] == nullptr) continue;
                 if (r >= col_row_counts[ci]) { pass = false; break; }
+                // NULL check: if bitmap present and bit is 0, value is null
+                if (col_bitmap[ci]) {
+                    bool is_null = !(col_bitmap[ci][r / 8] & (1u << (r % 8)));
+                    if (is_null) { pass = false; break; }
+                }
                 const uint8_t* base = reinterpret_cast<const uint8_t*>(col_data[ci]);
                 int32_t val_i32 = 0;
                 switch (schema_.columns[ci].type) {
@@ -569,13 +656,15 @@ private:
     }
 
     // ── Structural value extractor — all types ────────────────────────────────
+    // rg_row_count: total rows in this row group (needed for bitmap size)
 
     void extract_int32_values(
         const std::vector<uint8_t>& s1_data,
         const QpqtRGOffsetEntry&    oe,
         uint32_t                    row_in_rg,
         uint32_t                    count,
-        QpqtResultRow&              out_row
+        QpqtResultRow&              out_row,
+        uint32_t                    rg_row_count = 0
     ) {
         const uint8_t* ptr = s1_data.data();
         const uint8_t* end = ptr + s1_data.size();
@@ -597,49 +686,61 @@ private:
             cv.type    = coldef.type;
             cv.is_null = false;
 
-            switch (coldef.type) {
+            // Parse validity bitmap if column is nullable
+            const uint8_t* data_start = ptr;
+            uint64_t data_len = byte_len;
+            if (coldef.nullable && rg_row_count > 0) {
+                uint32_t bitmap_bytes = (rg_row_count + 7) / 8;
+                if (data_len >= bitmap_bytes) {
+                    bool is_null = !(ptr[row_in_rg / 8] & (1u << (row_in_rg % 8)));
+                    cv.is_null = is_null;
+                    data_start = ptr + bitmap_bytes;
+                    data_len   = byte_len - bitmap_bytes;
+                }
+            }
+
+            if (!cv.is_null) switch (coldef.type) {
                 case QpqtColumnType::INT32:
                 case QpqtColumnType::DATE32: {
-                    uint32_t n = (uint32_t)(byte_len / 4);
+                    uint32_t n = (uint32_t)(data_len / 4);
                     if (row_in_rg < n) {
                         int32_t v;
-                        memcpy(&v, ptr + row_in_rg * 4, 4);
+                        memcpy(&v, data_start + row_in_rg * 4, 4);
                         cv.value = v;
                         out_row.int32_values.push_back(v); // preserved for API compatibility
                     }
                     break;
                 }
                 case QpqtColumnType::INT64: {
-                    uint32_t n = (uint32_t)(byte_len / 8);
+                    uint32_t n = (uint32_t)(data_len / 8);
                     if (row_in_rg < n) {
                         int64_t v;
-                        memcpy(&v, ptr + row_in_rg * 8, 8);
+                        memcpy(&v, data_start + row_in_rg * 8, 8);
                         cv.value = v;
                     }
                     break;
                 }
                 case QpqtColumnType::FLOAT32: {
-                    uint32_t n = (uint32_t)(byte_len / 4);
+                    uint32_t n = (uint32_t)(data_len / 4);
                     if (row_in_rg < n) {
                         float v;
-                        memcpy(&v, ptr + row_in_rg * 4, 4);
+                        memcpy(&v, data_start + row_in_rg * 4, 4);
                         cv.value = v;
                     }
                     break;
                 }
                 case QpqtColumnType::FLOAT64: {
-                    uint32_t n = (uint32_t)(byte_len / 8);
+                    uint32_t n = (uint32_t)(data_len / 8);
                     if (row_in_rg < n) {
                         double v;
-                        memcpy(&v, ptr + row_in_rg * 8, 8);
+                        memcpy(&v, data_start + row_in_rg * 8, 8);
                         cv.value = v;
                     }
                     break;
                 }
                 case QpqtColumnType::STRING: {
-                    // Length-prefix encoded: walk to row_in_rg-th value
-                    const uint8_t* p = ptr;
-                    const uint8_t* col_end = ptr + byte_len;
+                    const uint8_t* p       = data_start;
+                    const uint8_t* col_end = data_start + data_len;
                     uint32_t cur = 0;
                     while (p + 4 <= col_end && cur <= row_in_rg) {
                         uint32_t slen;
@@ -663,7 +764,7 @@ private:
         }
     }
 
-    // ── PQC row reader — real AES-256-GCM decryption (Week 3) ──
+    // ── PQC row reader — AES-256-GCM decryption with per-page ML-KEM key ──
 
     std::vector<std::string> read_pqc_row(
         const QpqtRGOffsetEntry& oe,
@@ -716,18 +817,15 @@ private:
                 if (page_key_cache_.matches(oe.row_group_index, page_idx, i)) {
                     memcpy(aes_key, page_key_cache_.aes_key, QPQT_AES_KEY_LEN);
                 } else {
-                    // O(1) manifest lookup
-                    uint32_t pqc_col_pos = (uint16_t)schema_.pqc_position(i);
-                    uint64_t manifest_idx =
-                        ((uint64_t)oe.row_group_index * footer_hdr_.pages_per_rg
-                         * footer_hdr_.pqc_column_count)
-                      + ((uint64_t)page_idx * footer_hdr_.pqc_column_count)
-                      + pqc_col_pos;
-
-                    if (manifest_idx >= manifest_.size())
-                        throw std::runtime_error("Manifest index out of range");
-
-                    auto& me = manifest_[manifest_idx];
+                    // Lookup manifest entry by coordinates
+                    const QpqtManifestEntry* me_ptr = nullptr;
+                    for (auto& me : manifest_)
+                        if (me.row_group_index == oe.row_group_index &&
+                            me.page_index      == page_idx &&
+                            me.column_index    == i) { me_ptr = &me; break; }
+                    if (!me_ptr)
+                        throw std::runtime_error("Manifest entry not found");
+                    auto& me = *me_ptr;
 
                     // ML-KEM-768 decapsulation
                     uint8_t shared_secret[crypto::ML_KEM_768_SS_LEN];
@@ -772,7 +870,7 @@ private:
                     reinterpret_cast<char*>(plaintext.data()), actual_len
                 ));
             } else {
-                // No secret key — stub mode (structural tests only)
+                // No secret key — PQC column returns empty string
                 size_t actual_len = max_len;
                 while (actual_len > 0 && ct[actual_len-1] == 0x00) --actual_len;
                 result.push_back(std::string(

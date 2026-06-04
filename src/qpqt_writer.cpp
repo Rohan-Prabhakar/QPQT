@@ -54,11 +54,15 @@ public:
     // structural_cols: one flat byte buffer per structural column
     //                  (caller packs INT32/STRING etc per spec)
     // pqc_cols:        one vector<string> per PQC column
-    //                  (plaintext values, encryption added Week 3)
+    //                  (plaintext values, encrypted with ML-KEM-768 + AES-256-GCM)
+    // validity_masks: one vector<bool> per structural column (optional).
+    // If provided and column.nullable == true, a validity bitmap is prepended
+    // to the column byte block in Section 1 (bit=1 → non-null).
     void write_row_group(
-        uint32_t                                row_count,
-        const std::vector<std::vector<uint8_t>>& structural_cols,
-        const std::vector<std::vector<std::string>>& pqc_cols
+        uint32_t                                     row_count,
+        const std::vector<std::vector<uint8_t>>&     structural_cols,
+        const std::vector<std::vector<std::string>>& pqc_cols,
+        const std::vector<std::vector<bool>>&        validity_masks = {}
     ) {
         if (row_count > QPQT_ROWS_PER_ROW_GROUP)
             throw std::runtime_error("row_count exceeds ROWS_PER_ROW_GROUP");
@@ -89,19 +93,78 @@ public:
             (void)buf;
         }
 
-        // Cleaner structural write loop
+        // Structural column write loop
+        // Wire format per column: col_index(2) + byte_len(8) + [bitmap if nullable] + raw_data
         uint16_t s_pos = 0;
         for (uint16_t i = 0; i < schema_.column_count; ++i) {
             auto& col = schema_.columns[i];
             if (col.is_pqc_encrypted) continue;
 
-            const auto& data = structural_cols[s_pos++];
-            uint64_t byte_len = data.size();
+            const auto& data = structural_cols[s_pos];
 
-            // Write: column_index(2) + byte_length(8) + raw_data
+            // Build validity bitmap if column is nullable
+            std::vector<uint8_t> bitmap;
+            if (col.nullable && s_pos < validity_masks.size()) {
+                auto& mask = validity_masks[s_pos];
+                uint32_t bitmap_bytes = (row_count + 7) / 8;
+                bitmap.resize(bitmap_bytes, 0);
+                for (uint32_t r = 0; r < row_count && r < mask.size(); ++r)
+                    if (mask[r]) bitmap[r / 8] |= (1u << (r % 8));
+            }
+
+            uint64_t byte_len = bitmap.size() + data.size();
             write_bytes(file_, &i,        2);
             write_bytes(file_, &byte_len, 8);
+            if (!bitmap.empty())
+                write_bytes(file_, bitmap.data(), bitmap.size());
             write_bytes(file_, data.data(), data.size());
+
+            // Compute min/max statistics for this column
+            QpqtRGStatEntry stat{};
+            stat.row_group_index = rg_count_;
+            stat.col_index       = i;
+            stat.has_min         = 0;
+            stat.has_max         = 0;
+
+            auto compute_stats = [&](auto typed_ptr, uint32_t n_rows,
+                                     uint32_t elem_size) {
+                using T = std::remove_const_t<
+                          std::remove_pointer_t<decltype(typed_ptr)>>;
+                if (n_rows == 0) return;
+                T mn = typed_ptr[0], mx = typed_ptr[0];
+                for (uint32_t r = 1; r < n_rows; ++r) {
+                    // skip null rows if bitmap present
+                    if (!bitmap.empty() &&
+                        !(bitmap[r/8] & (1u << (r%8)))) continue;
+                    if (typed_ptr[r] < mn) mn = typed_ptr[r];
+                    if (typed_ptr[r] > mx) mx = typed_ptr[r];
+                }
+                memcpy(stat.min_bytes, &mn, sizeof(T));
+                memcpy(stat.max_bytes, &mx, sizeof(T));
+                stat.has_min = 1;
+                stat.has_max = 1;
+            };
+
+            if (!data.empty()) {
+                switch (col.type) {
+                    case QpqtColumnType::INT32:
+                    case QpqtColumnType::DATE32:
+                        compute_stats(reinterpret_cast<const int32_t*>(data.data()),
+                                      (uint32_t)(data.size()/4), 4); break;
+                    case QpqtColumnType::INT64:
+                        compute_stats(reinterpret_cast<const int64_t*>(data.data()),
+                                      (uint32_t)(data.size()/8), 8); break;
+                    case QpqtColumnType::FLOAT32:
+                        compute_stats(reinterpret_cast<const float*>(data.data()),
+                                      (uint32_t)(data.size()/4), 4); break;
+                    case QpqtColumnType::FLOAT64:
+                        compute_stats(reinterpret_cast<const double*>(data.data()),
+                                      (uint32_t)(data.size()/8), 8); break;
+                    default: break; // STRING: no min/max stats
+                }
+            }
+            stats_.push_back(stat);
+            ++s_pos;
         }
 
         // Pad Section 1 to 4KB boundary
@@ -115,7 +178,7 @@ public:
         // Section 2 starts here (4KB aligned)
         uint64_t section2_start = file_tell(file_);
 
-        // ── Section 2: PQC columns (Week 3: real AES-256-GCM encryption) ──
+        // ── Section 2: PQC columns — ML-KEM-768 encapsulation + AES-256-GCM per row ──
         uint16_t p_pos = 0;
         for (uint16_t i = 0; i < schema_.column_count; ++i) {
             auto& col = schema_.columns[i];
@@ -247,10 +310,17 @@ public:
             write_bytes(file_, &me, QpqtManifestEntry::SIZE);
         }
 
+        // Write stats block
+        uint64_t stats_pos = file_tell(file_);
+        uint32_t stats_count = (uint32_t)stats_.size();
+        write_bytes(file_, &stats_count, 4);
+        for (auto& se : stats_)
+            write_bytes(file_, &se, QpqtRGStatEntry::SIZE);
+
         // Write footer header
         QpqtFooterHeader fh{};
         fh.magic_end            = QPQT_MAGIC_END;
-        fh.reserved0            = 0;
+        fh.stats_offset         = (uint32_t)stats_pos;
         fh.offset_table_offset  = offset_table_pos;
         fh.manifest_offset      = manifest_pos;
         fh.manifest_entry_count = entry_count;
@@ -300,6 +370,7 @@ private:
 
     std::vector<QpqtRGOffsetEntry> rg_offsets_;
     std::vector<QpqtManifestEntry> manifest_;
+    std::vector<QpqtRGStatEntry>   stats_;     // one per (rg, structural_col)
 
     void write_file_header() {
         // Write placeholder header (backfilled in finalize())
@@ -386,7 +457,7 @@ inline std::vector<uint8_t> pack_date32_column(const std::vector<int32_t>& vals)
 }
 
 // ─────────────────────────────────────────────────────────
-// main — Week 1 smoke test
+// main — writer smoke test
 // TC-01: write 1 row, verify file structure
 // TC-03: write 4096 rows, verify one page
 // TC-05: write 100K rows, verify one row group
@@ -404,7 +475,7 @@ int main() {
         {"ssn",          QpqtColumnType::STRING,  true,  64}
     };
 
-    // Fake key_id (16 bytes) — Week 1 uses local stub
+    // Test key_id (16 bytes)
     uint8_t key_id[16] = {
         0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
         0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x10

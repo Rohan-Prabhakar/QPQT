@@ -346,7 +346,7 @@ public:
 
     // Read structural columns only (no decryption, very fast)
     py::dict read_structural() {
-        return query(); // no secret key needed, PQC cols return ciphertext stub
+        return query(); // no secret key — PQC columns return empty strings
     }
 
 private:

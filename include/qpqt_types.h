@@ -19,7 +19,7 @@ constexpr uint32_t QPQT_MAGIC           = 0x51505154; // "QPQT"
 constexpr uint32_t QPQT_MAGIC_END       = 0x54515051; // "TQPQ"
 constexpr uint32_t QPQT_KR_MAGIC        = 0x4B455952; // "KEYR"
 constexpr uint16_t QPQT_VERSION_MAJOR   = 1;
-constexpr uint16_t QPQT_VERSION_MINOR   = 0;
+constexpr uint16_t QPQT_VERSION_MINOR   = 1; // nullable columns + row group statistics
 constexpr uint32_t QPQT_KEM_ML_KEM_768  = 0x00000003;
 
 constexpr uint32_t QPQT_ROWS_PER_PAGE       = 4096;
@@ -76,6 +76,7 @@ struct QpqtColumnSchema {
     QpqtColumnType   type;
     bool             is_pqc_encrypted;
     uint32_t         max_value_bytes;  // max plaintext bytes for PQC cols
+    bool             nullable = false; // validity bitmap prefixed to column block in Section 1
 };
 
 // In-memory schema (decoded from disk)
@@ -200,7 +201,7 @@ static_assert(sizeof(QpqtRGOffsetEntry) == 32, "RGOffsetEntry must be 32 bytes")
 #pragma pack(push, 1)
 struct QpqtFooterHeader {
     uint32_t magic_end;                 // 0x54515051 "TQPQ"
-    uint32_t reserved0;
+    uint32_t stats_offset;              // absolute byte offset to stats block (0 = absent)
     uint64_t offset_table_offset;       // absolute byte offset
     uint64_t manifest_offset;           // absolute byte offset
     uint32_t manifest_entry_count;
@@ -212,6 +213,26 @@ struct QpqtFooterHeader {
     static constexpr size_t SIZE = 40;
 };
 static_assert(sizeof(QpqtFooterHeader) == 40, "FooterHeader must be 40 bytes");
+#pragma pack(pop)
+
+// ─────────────────────────────────────────────────────────
+// Row Group Statistics Entry — 26 bytes fixed
+// One entry per (row_group, structural_column) pair.
+// Enables row group skipping on range predicates.
+// ─────────────────────────────────────────────────────────
+
+#pragma pack(push, 1)
+struct QpqtRGStatEntry {
+    uint32_t row_group_index;
+    uint16_t col_index;
+    uint8_t  has_min;          // 0 = all null / empty
+    uint8_t  has_max;
+    uint8_t  min_bytes[8];     // little-endian, same encoding as column data
+    uint8_t  max_bytes[8];
+
+    static constexpr size_t SIZE = 24;
+};
+static_assert(sizeof(QpqtRGStatEntry) == 24, "RGStatEntry must be 24 bytes");
 #pragma pack(pop)
 
 // ─────────────────────────────────────────────────────────
