@@ -247,13 +247,6 @@ cmake .. && make -j$(nproc)
 | CLI | `qpqt encrypt/decrypt/inspect` on CSV or Parquet (build from source) |
 | DuckDB / Polars / Spark | `qpqt_arrow export` produces structural columns as Arrow IPC |
 
-## Roadmap
-
-- **v0.1 (current):** PyPI wheel, full crypto stack, CLI, Python bindings, Arrow export, 39 tests
-- **v0.2:** pandas `read_qpqt` / `to_qpqt` one-liners, Parquet read/write in CLI, DuckDB recipe
-- **v1.0:** Spark DataSource connector, ML-DSA-65 metadata signatures, threat model doc
-- **v2.0:** Distributed operation, S3/Azure direct integration
-
 ## License
 
 MIT
